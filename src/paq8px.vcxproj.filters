@@ -617,7 +617,76 @@
     <ClInclude Include="hybrid\Backend.hpp">
       <Filter>hybrid</Filter>
     </ClInclude>
+    <ClInclude Include="hybrid\ContainerLayout.hpp">
+      <Filter>hybrid</Filter>
+    </ClInclude>
+    <ClInclude Include="hybrid\ExecutableLayout.hpp">
+      <Filter>hybrid</Filter>
+    </ClInclude>
+    <ClInclude Include="hybrid\ExpertCodec.hpp">
+      <Filter>hybrid</Filter>
+    </ClInclude>
+    <ClInclude Include="hybrid\FeatureVector.hpp">
+      <Filter>hybrid</Filter>
+    </ClInclude>
+    <ClInclude Include="hybrid\FrozenRuleSet.hpp">
+      <Filter>hybrid</Filter>
+    </ClInclude>
+    <ClInclude Include="hybrid\GlobalLightHistory.hpp">
+      <Filter>hybrid</Filter>
+    </ClInclude>
     <ClInclude Include="hybrid\HybridFormat.hpp">
+      <Filter>hybrid</Filter>
+    </ClInclude>
+    <ClInclude Include="hybrid\OpenZlExpert.hpp">
+      <Filter>hybrid</Filter>
+    </ClInclude>
+    <ClInclude Include="hybrid\OpenZlPlanRegistry.hpp">
+      <Filter>hybrid</Filter>
+    </ClInclude>
+    <ClInclude Include="hybrid\PaqConfig.hpp">
+      <Filter>hybrid</Filter>
+    </ClInclude>
+    <ClInclude Include="hybrid\PaqModelSession.hpp">
+      <Filter>hybrid</Filter>
+    </ClInclude>
+    <ClInclude Include="hybrid\ProfileParameters.hpp">
+      <Filter>hybrid</Filter>
+    </ClInclude>
+    <ClInclude Include="hybrid\ProfileRegistry.hpp">
+      <Filter>hybrid</Filter>
+    </ClInclude>
+    <ClInclude Include="hybrid\ProfileTypes.hpp">
+      <Filter>hybrid</Filter>
+    </ClInclude>
+    <ClInclude Include="hybrid\ReconstructionRecipe.hpp">
+      <Filter>hybrid</Filter>
+    </ClInclude>
+    <ClInclude Include="hybrid\RoutedArchive.hpp">
+      <Filter>hybrid</Filter>
+    </ClInclude>
+    <ClInclude Include="hybrid\RoutedExecution.hpp">
+      <Filter>hybrid</Filter>
+    </ClInclude>
+    <ClInclude Include="hybrid\RoutedFormat.hpp">
+      <Filter>hybrid</Filter>
+    </ClInclude>
+    <ClInclude Include="hybrid\RoutedIO.hpp">
+      <Filter>hybrid</Filter>
+    </ClInclude>
+    <ClInclude Include="hybrid\RoutingPlan.hpp">
+      <Filter>hybrid</Filter>
+    </ClInclude>
+    <ClInclude Include="hybrid\RunSparseCodec.hpp">
+      <Filter>hybrid</Filter>
+    </ClInclude>
+    <ClInclude Include="hybrid\SaoSchemaParser.hpp">
+      <Filter>hybrid</Filter>
+    </ClInclude>
+    <ClInclude Include="hybrid\StateManager.hpp">
+      <Filter>hybrid</Filter>
+    </ClInclude>
+    <ClInclude Include="hybrid\ZipParser.hpp">
       <Filter>hybrid</Filter>
     </ClInclude>
     <ClInclude Include="filter\gif.hpp">

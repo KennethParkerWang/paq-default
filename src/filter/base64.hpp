@@ -102,33 +102,40 @@ public:
     ptr[1] = size & 255;
     ptr[2] = (size >> 8) & 255;
     ptr[3] = (size >> 16) & 255;
-    if (tlf != 0) {
-      if (tlf == 10) {
-        ptr[4] = 128;
-      }
-      else {
-        ptr[4] = 64;
-      }
-    }
-    else {
-      ptr[4] = (size >> 24) & 63; //1100 0000
-    }
+    const uint8_t newlineFlag = tlf == 10 ? 128u : tlf != 0 ? 64u : 0u;
+    ptr[4] = static_cast<uint8_t>(((size >> 24) & 63u) | newlineFlag);
     out->blockWrite(&ptr[0], olen);
   }
 
-  uint64_t decode(File* in, File* out, FMode fMode, uint64_t /*size*/, uint64_t& diffFound) override {
-    uint8_t inn[3];
-    int i = 0;
+  uint64_t decode(File* in, File* out, FMode fMode, uint64_t size,
+                  uint64_t& diffFound) override {
+    if (in == nullptr || out == nullptr || size < 5)
+      quit("Corrupted Base64 transform header.");
+    const uint64_t start = in->curPos();
+    if (start > UINT64_MAX - size)
+      quit("Corrupted Base64 transform length.");
+    const uint64_t end = start + size;
+    auto readByte = [&]() -> int {
+      if (in->curPos() >= end)
+        return EOF;
+      return in->getchar();
+    };
+    uint8_t inn[3] = {0, 0, 0};
     int len = 0;
     int blocksOut = 0;
-    int fle = 0;
-    int lineSize = in->getchar();
-    int outLen = in->getchar();
-    outLen += (in->getchar()) << 8;
-    outLen += (in->getchar()) << 16;
-    uint8_t tlf = in->getchar();
-    outLen += (tlf & 63) << 24;
-    Array<uint8_t> ptr((outLen >> 2) * 4 + 10);
+    const int lineSize = readByte();
+    const int length0 = readByte();
+    const int length1 = readByte();
+    const int length2 = readByte();
+    const int flags = readByte();
+    if (lineSize == EOF || length0 == EOF || length1 == EOF ||
+        length2 == EOF || flags == EOF)
+      quit("Corrupted Base64 transform header.");
+    const uint64_t outLen = static_cast<uint64_t>(length0) |
+      (static_cast<uint64_t>(length1) << 8) |
+      (static_cast<uint64_t>(length2) << 16) |
+      (static_cast<uint64_t>(flags & 63) << 24);
+    uint8_t tlf = static_cast<uint8_t>(flags & 192);
     tlf = (tlf & 192);
     if (tlf == 128) {
       tlf = 10; // LF: 10
@@ -140,10 +147,26 @@ public:
       tlf = 0;
     }
 
-    while (fle < outLen) {
+    uint64_t produced = 0;
+    auto emit = [&](uint8_t byte) {
+      if (produced >= outLen)
+        quit("Corrupted Base64 transform output length.");
+      if (fMode == FMode::FDECOMPRESS)
+        out->putChar(byte);
+      else if (fMode == FMode::FCOMPARE &&
+               byte != out->getchar() && diffFound == 0)
+        diffFound = produced + 1;
+      ++produced;
+    };
+
+    while (produced < outLen) {
+      // The final group may contain only one or two decoded bytes. Base64
+      // defines the missing low-order bytes as zero when forming its padded
+      // quartet; do not reuse bytes from the previous group.
+      inn[0] = inn[1] = inn[2] = 0;
       len = 0;
-      for (i = 0; i < 3; i++) {
-        int c = in->getchar();
+      for (int i = 0; i < 3; i++) {
+        const int c = readByte();
         if (c != EOF) {
           inn[i] = static_cast<uint8_t>(c);
           len++;
@@ -153,49 +176,35 @@ public:
         }
       }
       if (len != 0) {
-        uint8_t in0 = inn[0];
-        uint8_t in1 = inn[1];
-        uint8_t in2 = inn[2];
-        ptr[fle++] = (base64::table1[in0 >> 2]);
-        ptr[fle++] = (base64::table1[((in0 & 0x03) << 4) | ((in1 & 0xf0) >> 4)]);
-        ptr[fle++] = ((len > 1 ? base64::table1[((in1 & 0x0f) << 2) | ((in2 & 0xc0) >> 6)] : '='));
-        ptr[fle++] = ((len > 2 ? base64::table1[in2 & 0x3f] : '='));
+        const uint8_t in0 = inn[0];
+        const uint8_t in1 = inn[1];
+        const uint8_t in2 = inn[2];
+        emit(base64::table1[in0 >> 2]);
+        emit(base64::table1[((in0 & 0x03) << 4) |
+                            ((in1 & 0xf0) >> 4)]);
+        emit(len > 1 ? base64::table1[((in1 & 0x0f) << 2) |
+                                      ((in2 & 0xc0) >> 6)] : '=');
+        emit(len > 2 ? base64::table1[in2 & 0x3f] : '=');
         blocksOut++;
       }
       else {
-        if (fMode == FMode::FDECOMPRESS) {
-          quit("Unexpected Base64 decoding state");
-        }
-        else if (fMode == FMode::FCOMPARE) {
-          diffFound = fle;
-          break; // give up
-        }
+        quit("Corrupted Base64 transform payload.");
       }
       if (blocksOut >= (lineSize / 4) && lineSize != 0) { //no lf if lineSize==0
-        if ((blocksOut != 0) && !in->eof() && fle <= outLen) { //no lf if eof
+        if (blocksOut != 0 && in->curPos() < end && produced < outLen) {
           if (tlf != 0) {
-            ptr[fle++] = tlf;
+            emit(tlf);
           }
           else {
-            ptr[fle++] = 13;
-            ptr[fle++] = 10;
+            emit(13);
+            emit(10);
           }
         }
         blocksOut = 0;
       }
     }
-    //Write out or compare
-    if (fMode == FMode::FDECOMPRESS) {
-      out->blockWrite(&ptr[0], outLen);
-    }
-    else if (fMode == FMode::FCOMPARE) {
-      for (i = 0; i < outLen; i++) {
-        uint8_t b = ptr[i];
-        if (b != out->getchar() && (diffFound == 0)) {
-          diffFound = static_cast<int>(out->curPos());
-        }
-      }
-    }
+    if (in->curPos() != end)
+      quit("Corrupted Base64 transform contains trailing payload bytes.");
     return outLen;
   }
 };

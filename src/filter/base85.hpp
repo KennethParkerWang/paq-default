@@ -75,29 +75,36 @@ public:
     ptr[1] = size & 255;
     ptr[2] = size >> 8 & 255;
     ptr[3] = size >> 16 & 255;
-    if (tlf != 0) {
-      if (tlf == 10)
-        ptr[4] = 128;
-      else ptr[4] = 64;
-    }
-    else
-      ptr[4] = size >> 24 & 63; //1100 0000
+    const uint8_t newlineFlag = tlf == 10 ? 128u : tlf != 0 ? 64u : 0u;
+    ptr[4] = static_cast<uint8_t>(((size >> 24) & 63u) | newlineFlag);
     out->blockWrite(&ptr[0], olen);
   }
 
-  uint64_t decode(File* in, File* out, FMode fMode, uint64_t /*size*/, uint64_t& diffFound) override {
-    int i;
-    int fle = 0;
-    int nlsize = 0;
-    int outlen = 0;
-    int tlf = 0;
-    nlsize = in->getchar();
-    outlen = in->getchar();
-    outlen += (in->getchar() << 8);
-    outlen += (in->getchar() << 16);
-    tlf = (in->getchar());
-    outlen += ((tlf & 63) << 24);
-    Array<uint8_t, 1> ptr((outlen >> 2) * 5 + 10);
+  uint64_t decode(File* in, File* out, FMode fMode, uint64_t size,
+                  uint64_t& diffFound) override {
+    if (in == nullptr || out == nullptr || size < 5)
+      quit("Corrupted Base85 transform header.");
+    const uint64_t start = in->curPos();
+    if (start > UINT64_MAX - size)
+      quit("Corrupted Base85 transform length.");
+    const uint64_t end = start + size;
+    auto readByte = [&]() -> int {
+      if (in->curPos() >= end)
+        return EOF;
+      return in->getchar();
+    };
+    const int nlsize = readByte();
+    const int length0 = readByte();
+    const int length1 = readByte();
+    const int length2 = readByte();
+    int tlf = readByte();
+    if (nlsize == EOF || length0 == EOF || length1 == EOF ||
+        length2 == EOF || tlf == EOF)
+      quit("Corrupted Base85 transform header.");
+    const uint64_t outlen = static_cast<uint64_t>(length0) |
+      (static_cast<uint64_t>(length1) << 8) |
+      (static_cast<uint64_t>(length2) << 16) |
+      (static_cast<uint64_t>(tlf & 63) << 24);
     tlf = (tlf & 192);
     if (tlf == 128)
       tlf = NEW_LINE;
@@ -110,8 +117,20 @@ public:
     int lenlf = 0;
     uint32_t tuple = 0;
 
-    while (fle < outlen) {
-      c = in->getchar();
+    uint64_t produced = 0;
+    auto emit = [&](uint8_t byte) {
+      if (produced >= outlen)
+        quit("Corrupted Base85 transform output length.");
+      if (fMode == FMode::FDECOMPRESS)
+        out->putChar(byte);
+      else if (fMode == FMode::FCOMPARE &&
+               byte != out->getchar() && diffFound == 0)
+        diffFound = produced + 1;
+      ++produced;
+    };
+
+    while (produced < outlen) {
+      c = readByte();
       if (c != EOF) {
         tuple |= ((uint32_t)c) << ((3 - count++) * 8);
         if (count < 4) continue;
@@ -123,14 +142,14 @@ public:
       if (tuple == 0 && count == 4) { // for 0x00000000
         if (nlsize && lenlf >= nlsize) {
           if (tlf)
-            ptr[fle++] = (tlf);
+            emit(static_cast<uint8_t>(tlf));
           else {
-            ptr[fle++] = CARRIAGE_RETURN;
-            ptr[fle++] = NEW_LINE;
+            emit(CARRIAGE_RETURN);
+            emit(NEW_LINE);
           }
           lenlf = 0;
         }
-        ptr[fle++] = 'z';
+        emit('z');
       }
       else {
         for (i = 0; i < 5; i++) {
@@ -139,16 +158,17 @@ public:
         }
         lim = 4 - count;
         for (i = 4; i >= lim; i--) {
-          if (nlsize && lenlf >= nlsize && ((outlen - fle) >= 5)) {// skip nl if only 5 bytes left
+          if (nlsize && lenlf >= nlsize &&
+              ((outlen - produced) >= 5)) {// skip nl if only 5 bytes left
             if (tlf)
-              ptr[fle++] = (tlf);
+              emit(static_cast<uint8_t>(tlf));
             else {
-              ptr[fle++] = CARRIAGE_RETURN;
-              ptr[fle++] = NEW_LINE;
+              emit(CARRIAGE_RETURN);
+              emit(NEW_LINE);
             }
             lenlf = 0;
           }
-          ptr[fle++] = out[i];
+          emit(static_cast<uint8_t>(out[i]));
           lenlf++;
         }
       }
@@ -156,16 +176,8 @@ public:
       tuple = 0;
       count = 0;
     }
-    if (fMode == FMode::FDECOMPRESS) {
-      out->blockWrite(&ptr[0], outlen);
-    }
-    else if (fMode == FMode::FCOMPARE) {
-      for (i = 0; i < outlen; i++) {
-        uint8_t b = ptr[i];
-        if (b != out->getchar() && !diffFound) diffFound = out->curPos();
-      }
-    }
+    if (produced != outlen || in->curPos() != end)
+      quit("Corrupted Base85 transform payload length.");
     return outlen;
   }
 };
-

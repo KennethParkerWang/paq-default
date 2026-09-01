@@ -117,20 +117,27 @@ static int encodeLzw(File *in, File *out, uint64_t size, int &headerSize) {
   return 1;
 }
 
-static inline void writeCode(File *f, const FMode mode, int *buffer, uint64_t *pos, int *bitsUsed, const int bitsPerCode, const int code,
+static inline void writeCode(File *f, const FMode mode, uint32_t *buffer, uint64_t *pos, int *bitsUsed, const int bitsPerCode, const int code,
                              uint64_t *diffFound) {
-  *buffer <<= bitsPerCode;
-  *buffer |= code;
+  // Only the unconsumed low bits are retained between calls.  With at most
+  // seven retained bits and a 12-bit LZW code, this accumulator never needs
+  // more than 19 bits and every shift is defined for uint32_t.
+  *buffer = (*buffer << bitsPerCode) | static_cast<uint32_t>(code);
   (*bitsUsed) += bitsPerCode;
   while((*bitsUsed) > 7 ) {
-    const uint8_t b = *buffer >> (*bitsUsed -= 8);
+    const uint8_t b = static_cast<uint8_t>(*buffer >> (*bitsUsed -= 8));
     (*pos)++;
     if( mode == FMode::FDECOMPRESS ) {
       f->putChar(b);
-    } else if( mode == FMode::FCOMPARE && b != f->getchar()) {
+    } else if( mode == FMode::FCOMPARE && b != f->getchar() &&
+               *diffFound == 0) {
       *diffFound = *pos;
     }
   }
+  if (*bitsUsed == 0)
+    *buffer = 0;
+  else
+    *buffer &= (UINT32_C(1) << *bitsUsed) - 1;
 }
 
 static uint64_t decodeLzw(File *in, File *out, FMode mode, uint64_t &diffFound) {
@@ -138,7 +145,7 @@ static uint64_t decodeLzw(File *in, File *out, FMode mode, uint64_t &diffFound) 
   uint64_t pos = 0;
   int parent = -1;
   int code = 0;
-  int buffer = 0;
+  uint32_t buffer = 0;
   int bitsPerCode = 9;
   int bitsUsed = 0;
   writeCode(out, mode, &buffer, &pos, &bitsUsed, bitsPerCode, LZW_RESET_CODE, &diffFound);

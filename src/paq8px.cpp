@@ -8,9 +8,13 @@
 //////////////////////// Versioning ////////////////////////////////////////
 
 #define PROGNAME     "paq8pxhy"
-#define PROGVERSION  "218"  //hybrid outer archive carrying a v217 PAQ stream
+#define PROGVERSION  "219"  //routed-profile v2 outer archive
 #define PROGYEAR     "2026"
 
+#define ROUTED_STRUCTURED_PROGNAME    "paq8pxrp"
+#define ROUTED_STRUCTURED_PROGVERSION "218"
+#define LEGACY_HYBRID_PROGNAME        "paq8pxhy"
+#define LEGACY_HYBRID_PROGVERSION     "218"
 #define LEGACY_STRUCTURED_PROGNAME    "paq8pxsd"
 #define LEGACY_STRUCTURED_PROGVERSION "217"
 #define LEGACY_ORIGINAL_PROGNAME      "paq8px"
@@ -19,8 +23,12 @@
 
 #include "Utils.hpp"
 
+#include <algorithm>
+#include <filesystem>
 #include <stdexcept>  //std::exception
 #include <string> //std::stof, std::to_string
+#include <system_error>
+#include <vector>
 
 #include "Encoder.hpp"
 #include "ProgramChecker.hpp"
@@ -32,6 +40,8 @@
 #include "file/fileUtils2.hpp"
 #include "filter/Filters.hpp"
 #include "hybrid/Backend.hpp"
+#include "hybrid/RoutedArchive.hpp"
+#include "hybrid/RoutedExecution.hpp"
 #include "Models.hpp"
 #include "Simd.hpp"
 #include "PredictorBlock.hpp"
@@ -42,9 +52,290 @@
 typedef enum { DoNone, DoCompress, DoExtract, DoCompare, DoList } WHATTODO;
 
 enum class LegacyArchiveFlavor {
+  ROUTED_STRUCTURED_V218,
   STRUCTURED_V217,
   ORIGINAL_V216
 };
+
+// Output creation uses "wb+" and therefore truncates immediately. Resolve
+// both existing-file identity (which catches hard links and symlinks) and a
+// normalized absolute spelling before any create() call can touch source data.
+static std::filesystem::path normalizedAbsolutePath(const char* filename) {
+  namespace fs = std::filesystem;
+  if (filename == nullptr || filename[0] == 0)
+    quit("Cannot validate an empty file path.");
+  std::error_code error;
+  fs::path absolute = fs::absolute(fs::u8path(filename), error);
+  if (error) {
+    error.clear();
+    absolute = fs::u8path(filename);
+  }
+  fs::path resolved = fs::weakly_canonical(absolute, error);
+  return (error ? absolute : resolved).lexically_normal();
+}
+
+static bool filesystemPathsEqual(const std::filesystem::path& left,
+                                 const std::filesystem::path& right) {
+#if defined(_WIN32)
+  const std::wstring& leftNative = left.native();
+  const std::wstring& rightNative = right.native();
+  return CompareStringOrdinal(leftNative.c_str(), -1, rightNative.c_str(), -1,
+                              TRUE) == CSTR_EQUAL;
+#else
+  return left == right;
+#endif
+}
+
+static bool pathsAlias(const char* existingInput, const char* outputPath) {
+  namespace fs = std::filesystem;
+  std::error_code error;
+  if (fs::equivalent(fs::u8path(existingInput), fs::u8path(outputPath), error))
+    return true;
+
+  const fs::path input = normalizedAbsolutePath(existingInput);
+  const fs::path output = normalizedAbsolutePath(outputPath);
+  return filesystemPathsEqual(input, output);
+}
+
+static void requireDistinctInputAndOutput(const char* existingInput,
+                                          const char* outputPath,
+                                          const char* errorMessage) {
+  if (pathsAlias(existingInput, outputPath))
+    quit(errorMessage);
+}
+
+static bool pathIsWithinRoot(const std::filesystem::path& root,
+                             const std::filesystem::path& candidate) {
+  auto rootPart = root.begin();
+  auto candidatePart = candidate.begin();
+  for (; rootPart != root.end(); ++rootPart, ++candidatePart) {
+    if (candidatePart == candidate.end() ||
+        !filesystemPathsEqual(*rootPart, *candidatePart))
+      return false;
+  }
+  return true;
+}
+
+static bool archivedTargetsConflict(const std::filesystem::path& left,
+                                    const std::filesystem::path& right) {
+  if (filesystemPathsEqual(left, right))
+    return true;
+  return pathIsWithinRoot(left, right) || pathIsWithinRoot(right, left);
+}
+
+static bool extractionTargetsConflict(const std::filesystem::path& left,
+                                      const std::filesystem::path& right) {
+  namespace fs = std::filesystem;
+  if (archivedTargetsConflict(left, right))
+    return true;
+  std::error_code error;
+  if (fs::equivalent(left, right, error))
+    return true;
+  return false;
+}
+
+[[noreturn]] static void rejectArchivedPath(const char* pathKind,
+                                            const char* archivedName,
+                                            const char* reason) {
+  printf("\nUnsafe archived %s '%s': %s\n", pathKind,
+         archivedName == nullptr ? "" : archivedName, reason);
+  quit("Refusing unsafe path from multiple-file archive.");
+}
+
+static std::filesystem::path strictOutputRoot(const char* outputRoot) {
+  namespace fs = std::filesystem;
+  const char* rootSpelling =
+    outputRoot == nullptr || outputRoot[0] == 0 ? "." : outputRoot;
+  std::error_code error;
+  fs::path absolute = fs::absolute(fs::u8path(rootSpelling), error);
+  if (error)
+    quit("Unable to resolve the multiple-file output root.");
+  fs::path resolved = fs::weakly_canonical(absolute, error);
+  if (error)
+    quit("Unable to canonicalize the multiple-file output root.");
+  return resolved.lexically_normal();
+}
+
+static std::filesystem::path validateArchivedRelativePath(
+    const char* archivedName, const char* pathKind) {
+  namespace fs = std::filesystem;
+  if (archivedName == nullptr || archivedName[0] == 0)
+    rejectArchivedPath(pathKind, archivedName, "the filename is empty");
+
+  std::string portableName(archivedName);
+  std::replace(portableName.begin(), portableName.end(), '\\', '/');
+  const bool driveSpelling = portableName.size() >= 2 &&
+    ((portableName[0] >= 'A' && portableName[0] <= 'Z') ||
+     (portableName[0] >= 'a' && portableName[0] <= 'z')) &&
+    portableName[1] == ':';
+  if (portableName[0] == '/' || driveSpelling)
+    rejectArchivedPath(pathKind, archivedName,
+                       "absolute, rooted, drive and UNC paths are forbidden");
+  if (portableName.find("//") != std::string::npos)
+    rejectArchivedPath(pathKind, archivedName,
+                       "empty path components are forbidden");
+#if defined(_WIN32)
+  if (portableName.find(':') != std::string::npos)
+    rejectArchivedPath(pathKind, archivedName,
+                       "drive and alternate-data-stream paths are forbidden");
+#endif
+  if (portableName.back() == '/')
+    rejectArchivedPath(pathKind, archivedName,
+                       "the final filename component is empty");
+
+  const fs::path relative = fs::u8path(portableName);
+  if (relative.empty() || relative.is_absolute() || relative.has_root_name() ||
+      relative.has_root_directory())
+    rejectArchivedPath(pathKind, archivedName,
+                       "the path is not a relative filename");
+  for (const fs::path& part : relative) {
+    if (part == fs::path(".") || part == fs::path(".."))
+      rejectArchivedPath(pathKind, archivedName,
+                         "'.' and '..' components are forbidden");
+#if defined(_WIN32)
+    std::string component = part.u8string();
+    if (component.empty() || component.back() == '.' || component.back() == ' ')
+      rejectArchivedPath(pathKind, archivedName,
+                         "Windows path components cannot end in dot or space");
+    const size_t dot = component.find('.');
+    std::string device = component.substr(0, dot);
+    const size_t tilde = device.rfind('~');
+    bool numericTildeSuffix = tilde != std::string::npos && tilde > 0 &&
+                              tilde + 1 < device.size();
+    for (size_t index = numericTildeSuffix ? tilde + 1 : device.size();
+         numericTildeSuffix && index < device.size(); ++index) {
+      if (device[index] < '0' || device[index] > '9')
+        numericTildeSuffix = false;
+    }
+    const bool shortExtension = dot == std::string::npos ||
+                                component.size() - dot - 1 <= 3;
+    if (numericTildeSuffix && tilde <= 6 && device.size() <= 8 &&
+        shortExtension)
+      rejectArchivedPath(pathKind, archivedName,
+                         "DOS 8.3 short-name aliases are forbidden");
+    while (!device.empty() &&
+           (device.back() == '.' || device.back() == ' '))
+      device.pop_back();
+    for (char& ch : device) {
+      if (ch >= 'a' && ch <= 'z')
+        ch = static_cast<char>(ch - 'a' + 'A');
+    }
+    const bool numberedDevice = device.size() == 4 &&
+      (device.compare(0, 3, "COM") == 0 ||
+       device.compare(0, 3, "LPT") == 0) &&
+      device[3] >= '1' && device[3] <= '9';
+    const bool superscriptDevice = device.size() == 5 &&
+      (device.compare(0, 3, "COM") == 0 ||
+       device.compare(0, 3, "LPT") == 0) &&
+      static_cast<unsigned char>(device[3]) == 0xc2 &&
+      (static_cast<unsigned char>(device[4]) == 0xb9 ||
+       static_cast<unsigned char>(device[4]) == 0xb2 ||
+       static_cast<unsigned char>(device[4]) == 0xb3);
+    if (device == "CON" || device == "PRN" || device == "AUX" ||
+        device == "NUL" || device == "CLOCK$" || device == "CONIN$" ||
+        device == "CONOUT$" || numberedDevice || superscriptDevice)
+      rejectArchivedPath(pathKind, archivedName,
+                         "Windows reserved device names are forbidden");
+#endif
+  }
+  return relative;
+}
+
+static std::filesystem::path resolveContainedExtractionTarget(
+    const std::filesystem::path& outputRoot,
+    const std::filesystem::path& relative,
+    const char* archivedName, const char* pathKind) {
+  namespace fs = std::filesystem;
+  fs::path resolved = outputRoot;
+  for (auto part = relative.begin(); part != relative.end(); ++part) {
+    auto following = part;
+    ++following;
+    const bool finalComponent = following == relative.end();
+    fs::path next = (resolved / *part).lexically_normal();
+    std::error_code error;
+    const fs::file_status status = fs::symlink_status(next, error);
+    if (error && error != std::errc::no_such_file_or_directory)
+      rejectArchivedPath(pathKind, archivedName,
+                         "a target path component cannot be inspected safely");
+    if (!error && fs::is_symlink(status)) {
+      fs::path linkTarget = fs::read_symlink(next, error);
+      if (error)
+        rejectArchivedPath(pathKind, archivedName,
+                           "a symbolic link target cannot be resolved safely");
+      if (linkTarget.is_relative())
+        linkTarget = next.parent_path() / linkTarget;
+      resolved = fs::weakly_canonical(linkTarget, error);
+      if (error)
+        rejectArchivedPath(pathKind, archivedName,
+                           "a symbolic link target cannot be canonicalized");
+      resolved = resolved.lexically_normal();
+    }
+    else {
+      resolved = next;
+    }
+    if (!pathIsWithinRoot(outputRoot, resolved))
+      rejectArchivedPath(pathKind, archivedName,
+                         "the resolved target escapes the output root");
+    if (!finalComponent) {
+      error.clear();
+      const fs::file_status resolvedStatus = fs::status(resolved, error);
+      if (error && error != std::errc::no_such_file_or_directory)
+        rejectArchivedPath(
+          pathKind, archivedName,
+          "an intermediate target component cannot be inspected safely");
+      if (!error && fs::exists(resolvedStatus) &&
+          !fs::is_directory(resolvedStatus))
+        rejectArchivedPath(pathKind, archivedName,
+                           "an intermediate target component is not a directory");
+    }
+  }
+
+  std::error_code error;
+  resolved = fs::weakly_canonical(resolved, error);
+  if (error)
+    rejectArchivedPath(pathKind, archivedName,
+                       "the output target cannot be canonicalized");
+  resolved = resolved.lexically_normal();
+  if (!pathIsWithinRoot(outputRoot, resolved))
+    rejectArchivedPath(pathKind, archivedName,
+                       "the canonical target escapes the output root");
+  if (filesystemPathsEqual(outputRoot, resolved))
+    rejectArchivedPath(pathKind, archivedName,
+                       "the target does not name a file below the output root");
+  error.clear();
+  const fs::file_status finalStatus = fs::status(resolved, error);
+  if (error && error != std::errc::no_such_file_or_directory)
+    rejectArchivedPath(pathKind, archivedName,
+                       "the final target cannot be inspected safely");
+  if (!error && fs::exists(finalStatus)) {
+    if (!fs::is_regular_file(finalStatus))
+      rejectArchivedPath(pathKind, archivedName,
+                         "the final target is not a regular file");
+    error.clear();
+    const uintmax_t linkCount = fs::hard_link_count(resolved, error);
+    if (error)
+      rejectArchivedPath(pathKind, archivedName,
+                         "the final target link count cannot be inspected");
+    if (linkCount > 1)
+      rejectArchivedPath(pathKind, archivedName,
+                         "the final target has another hard-link name");
+  }
+  return resolved;
+}
+
+static std::string validatedExtractionTarget(
+    const std::filesystem::path& outputRoot, const char* archivedName,
+    const char* archiveName, const char* pathKind) {
+  const std::filesystem::path relative =
+    validateArchivedRelativePath(archivedName, pathKind);
+  const std::filesystem::path target = resolveContainedExtractionTarget(
+    outputRoot, relative, archivedName, pathKind);
+  const std::string targetUtf8 = target.u8string();
+  if (pathsAlias(archiveName, targetUtf8.c_str()))
+    rejectArchivedPath(pathKind, archivedName,
+                       "the target aliases the input archive");
+  return targetUtf8;
+}
 
 static bool consumeArchiveMagic(File* archive, const char* magic) {
   archive->setpos(0);
@@ -68,14 +359,17 @@ static int readRequiredArchiveByte(File* archive, const char* errorMessage) {
 static LegacyArchiveFlavor readLegacyArchiveSettings(File* archive, int& level,
                                                       Shared& shared) {
   LegacyArchiveFlavor flavor;
-  if (consumeArchiveMagic(archive, LEGACY_STRUCTURED_PROGNAME)) {
+  if (consumeArchiveMagic(archive, ROUTED_STRUCTURED_PROGNAME)) {
+    flavor = LegacyArchiveFlavor::ROUTED_STRUCTURED_V218;
+  }
+  else if (consumeArchiveMagic(archive, LEGACY_STRUCTURED_PROGNAME)) {
     flavor = LegacyArchiveFlavor::STRUCTURED_V217;
   }
   else if (consumeArchiveMagic(archive, LEGACY_ORIGINAL_PROGNAME)) {
     flavor = LegacyArchiveFlavor::ORIGINAL_V216;
   }
   else {
-    quit("Payload is neither a paq8pxsd v217 nor a paq8px v216 archive.");
+    quit("Payload is neither a paq8pxrp v218, paq8pxsd v217 nor paq8px v216 archive.");
   }
 
   level = readRequiredArchiveByte(archive, "Unexpected end of legacy PAQ archive header.");
@@ -94,9 +388,16 @@ static LegacyArchiveFlavor readLegacyArchiveSettings(File* archive, int& level,
 }
 
 static const char* legacyArchiveExtension(LegacyArchiveFlavor flavor) {
-  return flavor == LegacyArchiveFlavor::STRUCTURED_V217
-    ? "." LEGACY_STRUCTURED_PROGNAME LEGACY_STRUCTURED_PROGVERSION
-    : "." LEGACY_ORIGINAL_PROGNAME LEGACY_ORIGINAL_PROGVERSION;
+  switch (flavor) {
+    case LegacyArchiveFlavor::ROUTED_STRUCTURED_V218:
+      return "." ROUTED_STRUCTURED_PROGNAME ROUTED_STRUCTURED_PROGVERSION;
+    case LegacyArchiveFlavor::STRUCTURED_V217:
+      return "." LEGACY_STRUCTURED_PROGNAME LEGACY_STRUCTURED_PROGVERSION;
+    case LegacyArchiveFlavor::ORIGINAL_V216:
+      return "." LEGACY_ORIGINAL_PROGNAME LEGACY_ORIGINAL_PROGVERSION;
+  }
+  quit("Unknown PAQ archive flavor.");
+  return "";
 }
 
 static void printHelp() {
@@ -420,6 +721,12 @@ static void printModules() {
   printf("ZLIB: DISABLED, ");
 #endif
 
+#if defined(PAQ_ENABLE_OPENZL)
+  printf("OpenZL v0.2.0 routed expert: ENABLED");
+#else
+  printf("OpenZL routed expert: DISABLED (SAO falls back to PAQ)");
+#endif
+
   printf("\n");
 }
 
@@ -481,6 +788,48 @@ static void printOptions(Shared *shared, int level) {
   printf(" Skip RGB   (s) = %s\n", shared->GetOptionSkipRGB() ? "On  (Skip the color transform, just reorder the RGB channels)" : "Off");
   printf(" Use LSTM   (l) = %s\n", shared->GetOptionUseLSTM() ? "On  (Use LSTM (Long Short-Term Memory) model)" : "Off");
   printf(" File mode      = %s\n", shared->GetOptionMultipleFileMode() ? "Multiple" : "Single");
+}
+
+static void writeCompressionLog(const FileName& logfile, int argc,
+                                char** argv, const Shared& shared,
+                                const FileName& input, uint64_t contentSize,
+                                uint64_t archiveSize, double runtimeSeconds) {
+  if (logfile.strsize() == 0)
+    return;
+  const bool showParam = shared.tuning_param != 0.0f;
+  String results;
+  const int pathType = examinePath(logfile.c_str());
+  if (pathType == 3 ||
+      (pathType == 1 && getFileSize(logfile.c_str()) == 0)) {
+    results += "PROG_NAME\tPROG_VERSION\tCOMMAND_LINE\tLEVEL\t";
+    if (showParam)
+      results += "PARAM\t";
+    results += "INPUT_FILENAME\tORIGINAL_SIZE_BYTES\t"
+               "COMPRESSED_SIZE_BYTES\tRUNTIME_MS\n";
+  }
+  results += PROGNAME "\t" PROGVERSION "\t";
+  for (int index = 1; index < argc; ++index) {
+    if (index != 1)
+      results += ' ';
+    results += argv[index];
+  }
+  results += "\t";
+  results += uint64_t(shared.level);
+  results += "\t";
+  if (showParam) {
+    results += std::to_string(shared.tuning_param).c_str();
+    results += "\t";
+  }
+  results += input.c_str();
+  results += "\t";
+  results += contentSize;
+  results += "\t";
+  results += archiveSize;
+  results += "\t";
+  results += uint64_t(runtimeSeconds * 1000.0);
+  results += "\t\n";
+  appendToFile(logfile.c_str(), results.c_str());
+  printf("Results logged to file '%s'\n\n", logfile.c_str());
 }
 
 int processCommandLine(int argc, char **argv) {
@@ -700,45 +1049,6 @@ int processCommandLine(int argc, char **argv) {
       simdIset = detectedSimdIset;
     }
 
-    // Print anything only if the user wants/needs to know
-    if( verbose || simdIset != detectedSimdIset ) {
-      printSimdInfo(simdIset, detectedSimdIset);
-    }
-
-    // Set highest or user selected vectorization mode
-    if (simdIset == 11) {
-      shared.chosenSimd = SIMDType::SIMD_NEON;
-    } else if (simdIset >= 10) {
-      shared.chosenSimd = SIMDType::SIMD_AVX512;
-    } else if (simdIset >= 9) {
-      shared.chosenSimd = SIMDType::SIMD_AVX2;
-    } else if (simdIset >= 6) {
-      shared.chosenSimd = SIMDType::SIMD_SSE41;
-    } else if (simdIset >= 4) {
-      shared.chosenSimd = SIMDType::SIMD_SSE3;
-    } else if( simdIset >= 3 ) {
-      shared.chosenSimd = SIMDType::SIMD_SSE2;
-    } else {
-      shared.chosenSimd = SIMDType::SIMD_NONE;
-    }
-
-    if (!IS_ARM_NEON_AVAILABLE && shared.chosenSimd == SIMDType::SIMD_NEON) {
-      quit("The ARM Neon instruction set is not available on this platform.");
-    }
-    if (!IS_X64_SIMD_AVAILABLE && (
-      shared.chosenSimd == SIMDType::SIMD_SSE2 ||
-      shared.chosenSimd == SIMDType::SIMD_SSE3 ||
-      shared.chosenSimd == SIMDType::SIMD_SSE41 ||
-      shared.chosenSimd == SIMDType::SIMD_AVX2 ||
-      shared.chosenSimd == SIMDType::SIMD_AVX512
-      )) {
-      quit("The x64 SIMD instruction set is not available on this platform.");
-    }
-
-    if (simdIset > detectedSimdIset) {
-      printf("\nOverriding system highest vectorization support. Expect a crash.");
-    }
-
     // Successfully parsed command line arguments
     // Let's check their validity
 
@@ -749,6 +1059,12 @@ int processCommandLine(int argc, char **argv) {
     if( whattodo == DoNone ) {
       quit("A command switch is required: -0..-12 to compress, -d to decompress, -t to test, -l to list.");
     }
+#if defined(PAQ_DIRECT_VCXPROJ_BUILD) && !defined(PAQ_ENABLE_OPENZL)
+    fprintf(stderr,
+      "\nBuild profile: this direct compatibility build is PAQ-only; "
+      "OpenZL SAO routing is disabled. Use the canonical CMake build for "
+      "the complete routed expert profile.\n");
+#endif
     if( input.strsize() == 0 ) {
       printf("\nAn %s is required %s.\n", whattodo == DoCompress ? "input file or filelist" : "archive filename",
              whattodo == DoCompress ? "for compressing" : whattodo == DoExtract ? "for decompressing" : whattodo == DoCompare
@@ -904,6 +1220,30 @@ int processCommandLine(int argc, char **argv) {
         }
       }
       f.close();
+      // Freeze the same archived-name contract used by extraction before
+      // opening any listed member or creating the archive. This prevents the
+      // encoder from emitting a legacy multi-file archive that its decoder
+      // must reject or that maps two logical entries to one output target.
+      const std::filesystem::path archivedListTarget =
+        validateArchivedRelativePath(input.c_str(), "file-list filename");
+      std::vector<std::filesystem::path> archivedMemberTargets;
+      archivedMemberTargets.reserve(
+        static_cast<size_t>(listoffiles.getCount()));
+      for (int index = 0; index < listoffiles.getCount(); ++index) {
+        const char* archivedMember = listoffiles.getRelativeFilename(index);
+        const std::filesystem::path memberTarget =
+          validateArchivedRelativePath(archivedMember, "member filename");
+        if (archivedTargetsConflict(archivedListTarget, memberTarget))
+          rejectArchivedPath("member filename", archivedMember,
+                             "the target conflicts with the file-list output");
+        for (const std::filesystem::path& previous : archivedMemberTargets) {
+          if (archivedTargetsConflict(previous, memberTarget))
+            rejectArchivedPath(
+              "member filename", archivedMember,
+              "the target conflicts with another archive member");
+        }
+        archivedMemberTargets.push_back(memberTarget);
+      }
       //Verify input files
       for( int i = 0; i < listoffiles.getCount(); i++ ) {
         getFileSize(listoffiles.getfilename(i)); // Does file exist? Is it readable? (we don't actually need the file size now)
@@ -918,26 +1258,98 @@ int processCommandLine(int argc, char **argv) {
     FileTmp codecPayload;   // complete legacy PAQ archive carried by the hybrid frame
     File* codecArchive = &archive;
     const char* inputArchiveExtension = "." PROGNAME PROGVERSION;
+    bool nativeRoutedDecode = false;
+    bool nativeRoutedEncode = false;
 
     if( mode == DECOMPRESS ) {
       archive.open(archiveName.c_str(), true);
-      const bool isHybridArchive = hybrid::hasArchiveMagic(&archive);
-      if (isHybridArchive) {
+      const bool isRoutedArchive = routed::hasRoutedArchiveMagic(&archive);
+      const bool isHybridArchive = !isRoutedArchive && hybrid::hasArchiveMagic(&archive);
+      if (isRoutedArchive) {
         archive.setpos(0);
-        hybrid::readSingleFrameArchive(
-            &archive, &codecPayload, hybrid::RouteId::PAQ_LEGACY_ARCHIVE,
-            hybrid::DecoderContractId::PAQ8PX_LEGACY_ARCHIVE_V1);
+        const routed::RoutedArchiveLayout layout =
+          routed::inspectRoutedArchiveLayout(&archive);
+        if (layout.legacySingleArchive) {
+          archive.setpos(0);
+          routed::readSingleLegacyArchive(&archive, &codecPayload);
+          codecArchive = &codecPayload;
+        }
+        else {
+          nativeRoutedDecode = true;
+          archive.setpos(0);
+          codecArchive = nullptr;
+        }
+      }
+      else if (isHybridArchive) {
+        archive.setpos(0);
+        hybrid::readPaqLegacyArchive(&archive, &codecPayload);
         codecArchive = &codecPayload;
+        inputArchiveExtension =
+          "." LEGACY_HYBRID_PROGNAME LEGACY_HYBRID_PROGVERSION;
       }
       else {
         archive.setpos(0);
         codecArchive = &archive;
       }
 
-      const LegacyArchiveFlavor legacyFlavor =
-          readLegacyArchiveSettings(codecArchive, level, shared);
-      if (!isHybridArchive)
-        inputArchiveExtension = legacyArchiveExtension(legacyFlavor);
+      if (!nativeRoutedDecode) {
+        const LegacyArchiveFlavor legacyFlavor =
+            readLegacyArchiveSettings(codecArchive, level, shared);
+        if (!isRoutedArchive && !isHybridArchive)
+          inputArchiveExtension = legacyArchiveExtension(legacyFlavor);
+      }
+    }
+
+    const bool hasExternalModelState =
+      lstmLoadFilename.strsize() != 0 || lstmSaveFilename.strsize() != 0;
+    if (mode == COMPRESS) {
+      nativeRoutedEncode = routed::nativeRoutedEncodingAllowed(
+        shared, static_cast<uint8_t>(level),
+        shared.GetOptionMultipleFileMode(), hasExternalModelState);
+    }
+    if (nativeRoutedDecode && hasExternalModelState)
+      quit("Native routed archives do not accept external LSTM model state.");
+
+    // Native routed-v2 archives freeze the scalar PAQ implementation through
+    // their v1 PAQ-fragment decoder contract. SIMD selection remains a
+    // legacy-path runtime choice and must not reject or silently alter a
+    // native archive.
+    if (nativeRoutedEncode || nativeRoutedDecode) {
+      shared.chosenSimd = SIMDType::SIMD_NONE;
+      if (verbose || simdIset != detectedSimdIset)
+        printf("\nNative routed-v2 uses the frozen non-vectorized PAQ backend.\n");
+    }
+    else {
+      if (verbose || simdIset != detectedSimdIset)
+        printSimdInfo(simdIset, detectedSimdIset);
+
+      if (simdIset == 11)
+        shared.chosenSimd = SIMDType::SIMD_NEON;
+      else if (simdIset >= 10)
+        shared.chosenSimd = SIMDType::SIMD_AVX512;
+      else if (simdIset >= 9)
+        shared.chosenSimd = SIMDType::SIMD_AVX2;
+      else if (simdIset >= 6)
+        shared.chosenSimd = SIMDType::SIMD_SSE41;
+      else if (simdIset >= 4)
+        shared.chosenSimd = SIMDType::SIMD_SSE3;
+      else if (simdIset >= 3)
+        shared.chosenSimd = SIMDType::SIMD_SSE2;
+      else
+        shared.chosenSimd = SIMDType::SIMD_NONE;
+
+      if (!IS_ARM_NEON_AVAILABLE &&
+          shared.chosenSimd == SIMDType::SIMD_NEON)
+        quit("The ARM Neon instruction set is not available on this platform.");
+      if (!IS_X64_SIMD_AVAILABLE && (
+          shared.chosenSimd == SIMDType::SIMD_SSE2 ||
+          shared.chosenSimd == SIMDType::SIMD_SSE3 ||
+          shared.chosenSimd == SIMDType::SIMD_SSE41 ||
+          shared.chosenSimd == SIMDType::SIMD_AVX2 ||
+          shared.chosenSimd == SIMDType::SIMD_AVX512))
+        quit("The x64 SIMD instruction set is not available on this platform.");
+      if (simdIset > detectedSimdIset)
+        printf("\nOverriding system highest vectorization support. Expect a crash.");
     }
 
     // Load LSTM model if requested
@@ -957,7 +1369,8 @@ int processCommandLine(int argc, char **argv) {
 
     if( verbose ) {
       printCommand(whattodo);
-      printOptions(&shared, level);
+      if (!nativeRoutedDecode)
+        printOptions(&shared, level);
     }
     printf("\n");
 
@@ -969,16 +1382,36 @@ int processCommandLine(int argc, char **argv) {
         numberOfFiles = listoffiles.getCount();
         printf("Creating archive %s in multiple file mode with %d file%s...\n", archiveName.c_str(), numberOfFiles,
                numberOfFiles > 1 ? "s" : "");
+        FileName listSourceName(inputPath.c_str());
+        listSourceName += input.c_str();
+        requireDistinctInputAndOutput(
+          listSourceName.c_str(), archiveName.c_str(),
+          "Refusing to overwrite the multiple-file input list with its archive.");
+        for (int index = 0; index < numberOfFiles; ++index) {
+          requireDistinctInputAndOutput(
+            listoffiles.getfilename(index), archiveName.c_str(),
+            "Refusing to overwrite an input member with its archive.");
+        }
       } else { //single file mode
         printf("Creating archive %s in single file mode...\n", archiveName.c_str());
+        FileName sourceName(inputPath.c_str());
+        sourceName += input.c_str();
+        requireDistinctInputAndOutput(
+          sourceName.c_str(), archiveName.c_str(),
+          "Refusing to overwrite the input file with its archive.");
       }
       archive.create(archiveName.c_str());
-      codecArchive = &codecPayload;
-      codecArchive->append(LEGACY_STRUCTURED_PROGNAME);
-      codecArchive->putChar(level);
-      codecArchive->putChar(shared.options);
-      if(shared.GetOptionUseLSTM())
-        codecArchive->putChar(shared.LstmSettings.num_layers);
+      if (nativeRoutedEncode) {
+        codecArchive = &archive;
+      }
+      else {
+        codecArchive = &codecPayload;
+        codecArchive->append(ROUTED_STRUCTURED_PROGNAME);
+        codecArchive->putChar(level);
+        codecArchive->putChar(shared.options);
+        if(shared.GetOptionUseLSTM())
+          codecArchive->putChar(shared.LstmSettings.num_layers);
+      }
     }
 
     // In single file mode with no output filename specified we must construct it from the supplied archive filename
@@ -993,10 +1426,91 @@ int processCommandLine(int argc, char **argv) {
           quit();
         }
       }
+      if (mode == DECOMPRESS && whattodo == DoExtract) {
+        FileName outputName(outputPath.c_str());
+        outputName += output.c_str();
+        requireDistinctInputAndOutput(
+          archiveName.c_str(), outputName.c_str(),
+          "Refusing to overwrite the input archive with decoded output.");
+      }
     }
 
     if (lstmOnly && level > 0) {
       quit("The -lstmonly option is not compatible with specifying a compression level.");
+    }
+
+    // Native routed archives must dispatch before constructing any legacy
+    // Predictor/Models object. Several PAQ model accessors use function-static
+    // storage bound to the first Shared instance in the process.
+    if (nativeRoutedEncode) {
+      FileName sourceName(inputPath.c_str());
+      sourceName += input.c_str();
+      const uint64_t sourceSize = getFileSize(sourceName.c_str());
+      if (!shared.toScreen)
+        fprintf(stderr, "\nFilename: %s (%" PRIu64 " bytes)\n",
+                sourceName.c_str(), sourceSize);
+      printf("\nFilename: %s (%" PRIu64 " bytes)\n",
+             sourceName.c_str(), sourceSize);
+
+      const routed::NativeRoutedStats stats = routed::encodeNativeSingleFile(
+        &archive, sourceName.c_str(), sourceSize, shared,
+        static_cast<uint8_t>(level), hasExternalModelState);
+      printf("-----------------------\n");
+      printf("Total input size     : %" PRIu64 "\n", stats.sourceBytes);
+      printf("Total archive size   : %" PRIu64 "\n", stats.archiveBytes);
+      printf("Routed segments      : %u (PAQ %u, external %u)\n\n",
+             stats.segmentCount, stats.paqFragmentCount,
+             stats.externalExpertCount);
+      writeCompressionLog(logfile, argc, argv, shared, input,
+                          stats.sourceBytes, stats.archiveBytes,
+                          programChecker->getRuntime());
+      archive.close();
+      programChecker->print();
+      return 0;
+    }
+
+    if (nativeRoutedDecode) {
+      if (whattodo == DoList)
+        quit("Native single-file routed archives do not store a file list.");
+      if (whattodo != DoExtract && whattodo != DoCompare)
+        quit("Native routed archives require extract or compare mode.");
+      if (shared.GetOptionUseLSTM() || shared.GetOptionTrainExe() ||
+          shared.GetOptionTrainTxt())
+        quit("Native routed decoding is controlled only by archived model state.");
+
+      FileName outputName(outputPath.c_str());
+      outputName += output.c_str();
+      FileDisk nativeOutput;
+      const FMode outputMode = whattodo == DoExtract
+        ? FMode::FDECOMPRESS : FMode::FCOMPARE;
+      if (outputMode == FMode::FDECOMPRESS) {
+        nativeOutput.create(outputName.c_str());
+        printf("Extracting");
+      }
+      else {
+        nativeOutput.open(outputName.c_str(), true);
+        printf("Comparing");
+      }
+      printf(" %s -> ", outputName.c_str());
+      const routed::NativeRoutedStats stats = routed::decodeNativeSingleFile(
+        &archive, &nativeOutput, outputMode, shared);
+      if (outputMode == FMode::FCOMPARE && stats.firstDifference != 0)
+        printf("differ at %" PRIu64 "\n", stats.firstDifference - 1);
+      else if (outputMode == FMode::FCOMPARE && stats.comparedFileIsLonger)
+        printf("file is longer\n");
+      else if (outputMode == FMode::FCOMPARE)
+        printf("identical\n");
+      else
+        printf("done (%" PRIu64 " bytes)\n", stats.sourceBytes);
+      if (verbose) {
+        printf(" Routed segments = %u (PAQ %u, external %u)\n",
+               stats.segmentCount, stats.paqFragmentCount,
+               stats.externalExpertCount);
+      }
+      nativeOutput.close();
+      archive.close();
+      programChecker->print();
+      return 0;
     }
 
     shared.init(level);
@@ -1059,7 +1573,8 @@ int processCommandLine(int argc, char **argv) {
     if( mode == DECOMPRESS && shared.GetOptionMultipleFileMode()) {
       const char *errmsgInvalidChar = "Invalid character or unexpected end of archive file.";
       // name of listfile
-      FileName listFilename(outputPath.c_str());
+      FileName archivedListFilename;
+      FileName listFilename;
       if( output.strsize() != 0 ) {
         quit("Output filename must not be specified when extracting multiple files.");
       }
@@ -1071,19 +1586,67 @@ int processCommandLine(int argc, char **argv) {
         if( c == 255 ) {
           quit(errmsgInvalidChar);
         }
-        listFilename += static_cast<char>(c);
+        archivedListFilename += static_cast<char>(c);
       }
       while((c = en.decompressByte(predictorMain.get())) != 0 ) {
         if( c == 255 ) {
           quit(errmsgInvalidChar);
         }
-        listoffiles.addChar(static_cast<char>(c));
+        listoffiles.addChar(c);
       }
+      listoffiles.addChar(EOF);
+
+      numberOfFiles = listoffiles.getCount();
+      if (whattodo == DoList) {
+        // Listing has no filesystem target, but malformed archive spellings
+        // are still rejected deterministically.
+        validateArchivedRelativePath(archivedListFilename.c_str(),
+                                     "file-list filename");
+        for (int index = 0; index < numberOfFiles; ++index) {
+          validateArchivedRelativePath(
+            listoffiles.getRelativeFilename(index), "member filename");
+        }
+      }
+      else {
+        // Resolve every archive-controlled path and reject all conflicts
+        // before the first create/open. Ordinary relative legacy names retain
+        // their directory layout, but no target may escape the output root,
+        // alias the archive, collide with the list file or another member, or
+        // be an ancestor/descendant of another output file.
+        const std::filesystem::path extractionRoot =
+          strictOutputRoot(outputPath.c_str());
+        const std::string resolvedListFilename = validatedExtractionTarget(
+          extractionRoot, archivedListFilename.c_str(), archiveName.c_str(),
+          "file-list filename");
+        listFilename += resolvedListFilename.c_str();
+        const std::filesystem::path listTarget =
+          std::filesystem::u8path(resolvedListFilename);
+        for (int index = 0; index < numberOfFiles; ++index) {
+          const char* archivedMember =
+            listoffiles.getRelativeFilename(index);
+          const std::string resolvedMember = validatedExtractionTarget(
+            extractionRoot, archivedMember, archiveName.c_str(),
+            "member filename");
+          const std::filesystem::path memberTarget =
+            std::filesystem::u8path(resolvedMember);
+          if (extractionTargetsConflict(listTarget, memberTarget))
+            rejectArchivedPath("member filename", archivedMember,
+                               "the target conflicts with the file-list output");
+          for (int previous = 0; previous < index; ++previous) {
+            if (extractionTargetsConflict(
+                  std::filesystem::u8path(listoffiles.getfilename(previous)),
+                  memberTarget))
+              rejectArchivedPath(
+                "member filename", archivedMember,
+                "the target conflicts with another archive member");
+          }
+          listoffiles.setResolvedFilename(index, resolvedMember.c_str());
+        }
+      }
+
       if( whattodo == DoList ) {
         printf("File list of %s archive:\n", archiveName.c_str());
       }
-
-      numberOfFiles = listoffiles.getCount();
 
       //write filenames to screen or listfile or verify (compare) contents
       if( whattodo == DoList ) {
@@ -1150,13 +1713,10 @@ int processCommandLine(int argc, char **argv) {
       en.flush();
       totalSize += en.size() - preFlush; //we consider padding bytes as auxiliary bytes
       const uint64_t legacyArchiveSize = en.size();
-      const hybrid::Backend& backend = hybrid::BackendRegistry::require(
-          hybrid::RouteId::PAQ_LEGACY_ARCHIVE,
-          hybrid::DecoderContractId::PAQ8PX_LEGACY_ARCHIVE_V1);
-      hybrid::writeSingleFrameArchive(&archive, backend, codecArchive);
+      routed::writeSingleLegacyArchive(&archive, codecArchive);
       finalArchiveSize = archive.curPos();
       if (finalArchiveSize < legacyArchiveSize)
-        quit("Hybrid archive framing produced an invalid total length.");
+        quit("Routed archive framing produced an invalid total length.");
       totalSize += finalArchiveSize - legacyArchiveSize;
       printf("-----------------------\n");
       printf("Total input size     : %" PRIu64 "\n", contentSize);

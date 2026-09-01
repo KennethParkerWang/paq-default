@@ -17,14 +17,21 @@ public:
    * @param size
    * @param info
    */
-  void encode(File* in, File* out, uint64_t size, int info, int& headerSize) override {
+  void encode(File* in, File* out, uint64_t size, int /*info*/,
+              int& /*headerSize*/) override {
+    if (in == nullptr || out == nullptr)
+      quit("DEC Alpha transform input or output is unavailable.");
     Array<uint8_t> blk(block);
     for (uint64_t offset = 0; offset < size; offset += block) {
-      uint64_t length = std::min<uint64_t>(size - offset, block), bytesRead = static_cast<int>(in->blockRead(&blk[0], length));
+      const uint64_t length = std::min<uint64_t>(size - offset, block);
+      const uint64_t bytesRead = in->blockRead(&blk[0], length);
       if (bytesRead != length)
         quit("encodeDECAlpha read error");
-      for (size_t i = 0; i < static_cast<size_t>(bytesRead) - 3; i += 4) {
-        uint32_t instruction = blk[i] | (blk[i + 1] << 8) | (blk[i + 2] << 16) | (blk[i + 3] << 24);
+      for (size_t i = 0; i + 3 < static_cast<size_t>(bytesRead); i += 4) {
+        uint32_t instruction = static_cast<uint32_t>(blk[i]) |
+          (static_cast<uint32_t>(blk[i + 1]) << 8) |
+          (static_cast<uint32_t>(blk[i + 2]) << 16) |
+          (static_cast<uint32_t>(blk[i + 3]) << 24);
         if ((instruction >> 21) == (0x34 << 5) + 26) { // bsr r26, offset
           uint32_t addr = instruction & 0x1FFFFF;
           addr += static_cast<uint32_t>(offset + i) / 4u;
@@ -38,6 +45,8 @@ public:
         blk[i + 3] = instruction >> 24;
       }
       out->blockWrite(&blk[0], bytesRead);
+      if (length < block)
+        break;
     }
   }
 
@@ -51,15 +60,20 @@ public:
    * @return
    */
   uint64_t decode(File* /*in*/, File* out, FMode fMode, uint64_t size, uint64_t& diffFound) override {
+    if (encoder == nullptr || out == nullptr)
+      quit("DEC Alpha decoder input or output is unavailable.");
     Array<uint8_t> blk(block);
     for (uint64_t offset = 0; offset < size; offset += block) {
-      uint64_t length = std::min<uint64_t>(size - offset, block);
-      for (size_t i = 0; i < static_cast<size_t>(length) - 3; i += 4) {
+      const uint64_t length = std::min<uint64_t>(size - offset, block);
+      for (size_t i = 0; i + 3 < static_cast<size_t>(length); i += 4) {
         blk[i]     = encoder->decompressByte(encoder->predictorMain);
         blk[i + 1] = encoder->decompressByte(encoder->predictorMain);
         blk[i + 2] = encoder->decompressByte(encoder->predictorMain);
         blk[i + 3] = encoder->decompressByte(encoder->predictorMain);
-        uint32_t instruction = (blk[i] | (blk[i + 1] << 8) | (blk[i + 2] << 16) | (blk[i + 3] << 24));
+        uint32_t instruction = static_cast<uint32_t>(blk[i]) |
+          (static_cast<uint32_t>(blk[i + 1]) << 8) |
+          (static_cast<uint32_t>(blk[i + 2]) << 16) |
+          (static_cast<uint32_t>(blk[i + 3]) << 24);
         DECAlpha::Unshuffle(instruction);
         if ((instruction >> 21) == (0x34 << 5) + 26) { // bsr r26, offset
           uint32_t addr = instruction & 0x1FFFFF;
@@ -82,12 +96,13 @@ public:
       }
       else if (fMode == FMode::FCOMPARE) {
         for (size_t i = 0; i < static_cast<size_t>(length); i++) {
-          if (blk[i] != out->getchar()) {
-            diffFound = offset + i;
-            return 0;
-          }
+          const int expected = out->getchar();
+          if (blk[i] != expected && diffFound == 0)
+            diffFound = offset + i + 1;
         }
       }
+      if (length < block)
+        break;
     }
     return size;
   }

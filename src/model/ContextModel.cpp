@@ -28,6 +28,7 @@ int ContextModel::p() {
       int blockInfo = shared->State.blockInfo;
 
       uint32_t fixedLineLengthForWordModel = 0;
+      bool wideTextModelOnly = false;
 
       if (blockType == BlockType::MRB) {
         const uint8_t packingMethod = (blockInfo >> 24) & 3; //0..3
@@ -67,6 +68,14 @@ int ContextModel::p() {
                 ? recordInfo.stride
                 : 0);
       }
+      else if (blockType == BlockType::WIDE_TEXT) {
+        const structured::WideTextInfo wideInfo =
+            structured::unpackWideTextInfo(static_cast<uint32_t>(blockInfo));
+        wideTextModelOnly =
+            wideInfo.transform == structured::WideTextTransform::MODEL_ONLY;
+        RecordModel& recordModel = models->recordModel();
+        recordModel.setParam(wideTextModelOnly ? wideInfo.elementBytes : 0);
+      }
       else if (blockType == BlockType::DEC_ALPHA) {
         RecordModel& recordModel = models->recordModel();
         uint32_t fixedRecordLenght = 16;
@@ -84,7 +93,7 @@ int ContextModel::p() {
         recordModel.setParam(0); //enable automatic record length detection
       }
 
-      bool isText = isTEXT(blockType);
+      bool isText = isTEXT(blockType) || wideTextModelOnly;
       TextModel& textModel = models->textModel();
       textModel.setCmScale(isText ? 74 : 64);
       WordModel& wordModel = models->wordModel();

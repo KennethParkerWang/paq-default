@@ -2,6 +2,10 @@
 
 #include "../BlockType.hpp"
 #include "../file/File.hpp"
+#include "../hybrid/FeatureVector.hpp"
+#include "../hybrid/FrozenRuleSet.hpp"
+#include "../hybrid/ProfileParameters.hpp"
+#include "../hybrid/ProfileRegistry.hpp"
 #include "StructuredDataFilter.hpp"
 
 #include <algorithm>
@@ -19,11 +23,13 @@ struct SecondaryDecision {
   BlockType type = BlockType::DEFAULT;
   uint32_t info = 0;
   double estimatedGainBpb = 0.0;
+  routed::RouteDecision route = routed::ProfileRegistry::fallback();
 };
 
 namespace default_structure_detail {
 
 constexpr uint64_t kMinimumBlockSize = 16u * 1024u;
+constexpr uint64_t kMinimumRecordBlockSize = 256u * 1024u;
 constexpr size_t kMaximumWindowSize = 64u * 1024u;
 constexpr size_t kMinimumRows = 48;
 constexpr size_t kMaximumRowBytes = 4096;
@@ -347,13 +353,13 @@ inline Candidate detectRecord(const std::vector<uint8_t>& first,
                               const ProxyCosts& secondBaseline) {
   Candidate best;
   const size_t maximumStride = std::min<size_t>(512, first.size() / 64);
-  if (maximumStride < 2)
+  if (maximumStride < 16)
     return best;
 
   const LagStatistics firstStatistics = makeLagStatistics(first);
   const LagStatistics secondStatistics = makeLagStatistics(second);
   std::vector<RankedParameter> shortlist;
-  for (size_t stride = 2; stride <= maximumStride; ++stride) {
+  for (size_t stride = 16; stride <= maximumStride; ++stride) {
     // The adaptive full proxy also charges cold-start cost.  This small rank
     // penalty prevents harmonics with hundreds of fields from crowding out a
     // simpler fundamental period.
@@ -385,25 +391,9 @@ inline Candidate detectRecord(const std::vector<uint8_t>& first,
                                                  structured::RecordTransform::MODEL_ONLY),
                       firstModelGain, secondModelGain, 0.075, sizePenalty, evidence);
 
-    const std::vector<uint8_t> firstTransposed = recordTranspose(first, stride, false);
-    const std::vector<uint8_t> secondTransposed = recordTranspose(second, stride, false);
-    const double firstTransposeGain = firstBaseline.mixed - proxyCosts(firstTransposed).mixed;
-    const double secondTransposeGain = secondBaseline.mixed - proxyCosts(secondTransposed).mixed;
-    considerCandidate(best, BlockType::RECORD,
-                      structured::packRecordInfo(static_cast<uint16_t>(stride),
-                                                 structured::RecordTransform::TRANSPOSE),
-                      firstTransposeGain, secondTransposeGain, 0.105,
-                      sizePenalty + 0.018, evidence);
-
-    const std::vector<uint8_t> firstDelta = recordTranspose(first, stride, true);
-    const std::vector<uint8_t> secondDelta = recordTranspose(second, stride, true);
-    const double firstDeltaGain = firstBaseline.mixed - proxyCosts(firstDelta).mixed;
-    const double secondDeltaGain = secondBaseline.mixed - proxyCosts(secondDelta).mixed;
-    considerCandidate(best, BlockType::RECORD,
-                      structured::packRecordInfo(static_cast<uint16_t>(stride),
-                                                 structured::RecordTransform::TRANSPOSE_DELTA),
-                      firstDeltaGain, secondDeltaGain, 0.125,
-                      sizePenalty + 0.040, evidence);
+    // Statistical evidence may select a context stride, but never a byte
+    // reordering. Columnar/delta transforms require an exact parser or trusted
+    // schema and are routed through separate, non-automatic profiles.
   }
   return best;
 }
@@ -702,6 +692,8 @@ inline Candidate detectWideText(const std::vector<uint8_t>& first,
                                 const std::vector<uint8_t>& second,
                                 const ProxyCosts& firstBaseline,
                                 const ProxyCosts& secondBaseline) {
+  (void)firstBaseline;
+  (void)secondBaseline;
   Candidate best;
   for (const uint8_t width : {uint8_t{2}, uint8_t{4}}) {
     const WideEvidence firstEvidence = wideEvidence(first, width);
@@ -710,25 +702,26 @@ inline Candidate detectWideText(const std::vector<uint8_t>& first,
         firstEvidence.contentLane != secondEvidence.contentLane)
       continue;
 
-    const double firstGain = firstBaseline.mixed - proxyCosts(byteShuffle(first, width)).mixed;
-    const double secondGain = secondBaseline.mixed - proxyCosts(byteShuffle(second, width)).mixed;
-    // Specific ASCII/NUL-lane evidence breaks an otherwise artificial tie
-    // with NUMERIC BYTE_SHUFFLE, whose physical transform is intentionally the
-    // same but whose model routing and archive meaning differ.
-    const double specificity =
-      0.045 + std::min(0.045, 0.12 * std::min(firstEvidence.confidence,
-                                              secondEvidence.confidence));
-    considerCandidate(best, BlockType::WIDE_TEXT,
-                      structured::packWideTextInfo(width), firstGain, secondGain,
-                      0.095, 0.010, specificity);
+    const double confidence =
+      std::min(firstEvidence.confidence, secondEvidence.confidence);
+    const double score = 0.20 + confidence;
+    if (!best.valid || score > best.score) {
+      best.type = BlockType::WIDE_TEXT;
+      best.info = structured::packWideTextInfo(
+        width, structured::WideTextTransform::MODEL_ONLY);
+      best.gain = 0.0; // No unverified compression saving is claimed.
+      best.score = score;
+      best.valid = true;
+    }
   }
   return best;
 }
 
 } // namespace default_structure_detail
 
-// Examine two deterministic, non-overlapping encoder-side windows.  At most
-// 128 KiB is read regardless of block size.  Every exit restores File::curPos().
+// Examine deterministic non-overlapping encoder-side windows. Wide text needs
+// agreement at both ends; record stride additionally needs agreement in two
+// independent interior/end pairs. Every exit restores File::curPos().
 inline SecondaryDecision detectDefaultStructure(File* const in,
                                                 const uint64_t blockStart,
                                                 const uint64_t blockSize) {
@@ -742,7 +735,7 @@ inline SecondaryDecision detectDefaultStructure(File* const in,
     return fallback;
 
   size_t windowSize = static_cast<size_t>(std::min<uint64_t>(
-    default_structure_detail::kMaximumWindowSize, blockSize / 2));
+    default_structure_detail::kMaximumWindowSize, blockSize / 4));
   windowSize &= ~size_t{7};
   if (windowSize < 4096)
     return fallback;
@@ -757,36 +750,98 @@ inline SecondaryDecision detectDefaultStructure(File* const in,
       !default_structure_detail::readWindow(in, blockStart + secondOffset, windowSize, second))
     return fallback;
 
-  const default_structure_detail::ProxyCosts firstBaseline =
-    default_structure_detail::proxyCosts(first);
-  const default_structure_detail::ProxyCosts secondBaseline =
-    default_structure_detail::proxyCosts(second);
+  // Tier 1: strict wide-text content evidence. This is a semantic check, not
+  // a competition against unrelated transform proxies.
+  const routed::WideTextFeature firstWide = routed::inferWideText(first);
+  const routed::WideTextFeature secondWide = routed::inferWideText(second);
+  if (firstWide.valid && secondWide.valid &&
+      firstWide.codeUnitBytes == secondWide.codeUnitBytes &&
+      firstWide.contentLane == secondWide.contentLane) {
+    SecondaryDecision decision;
+    decision.type = BlockType::WIDE_TEXT;
+    decision.info = structured::packWideTextInfo(
+      firstWide.codeUnitBytes, structured::WideTextTransform::MODEL_ONLY);
+    decision.estimatedGainBpb = 0.0;
+    decision.route.pipeline = {routed::ProfileId::TEXT_WIDE, 1, 0};
+    decision.route.evidence = routed::EvidenceKind::STRICT_CONTENT;
+    decision.route.statePolicy = routed::StatePolicy::CONTINUE_LOCAL;
+    decision.route.expert = routed::ExpertId::PAQ_WIDE_TEXT;
+    decision.route.transform = routed::TransformId::NONE;
+    routed::TextParams textParams;
+    if (firstWide.codeUnitBytes == 2) {
+      textParams.encoding = firstWide.contentLane == 0
+        ? routed::TextEncoding::UTF16_LE : routed::TextEncoding::UTF16_BE;
+      textParams.hasBom = first.size() >= 2 &&
+        ((first[0] == 0xff && first[1] == 0xfe) ||
+         (first[0] == 0xfe && first[1] == 0xff));
+    }
+    else {
+      textParams.encoding = firstWide.contentLane == 0
+        ? routed::TextEncoding::UTF32_LE : routed::TextEncoding::UTF32_BE;
+      textParams.hasBom = first.size() >= 4 &&
+        ((first[0] == 0xff && first[1] == 0xfe && first[2] == 0 && first[3] == 0) ||
+         (first[0] == 0 && first[1] == 0 && first[2] == 0xfe && first[3] == 0xff));
+    }
+    // Only bounded windows are validated; unsampled original bytes are still
+    // preserved and modeled verbatim rather than treated as canonical Unicode.
+    textParams.preserveInvalidSequences = true;
+    decision.route.parameters = routed::encodeTextParams(textParams);
+    decision.route.reasonCode = 0x01010001u;
+    decision.route.scoreQ8 = std::min(firstWide.scoreQ8, secondWide.scoreQ8);
+    decision.route.selected = true;
+    if (routed::ProfileRegistry::validateAutomaticDecision(decision.route, blockSize))
+      return decision;
+  }
 
-  // There is intentionally no entropy-first rejection here.  A high-H0 byte
-  // stream can still have strong record, row, or lane structure.
-  std::array<default_structure_detail::Candidate, 3> families = {
-    default_structure_detail::detectRecord(first, second, firstBaseline, secondBaseline),
-    default_structure_detail::detectNumeric(first, second, firstBaseline, secondBaseline),
-    default_structure_detail::detectWideText(first, second, firstBaseline, secondBaseline)
-  };
-  std::sort(families.begin(), families.end(),
-            [](const default_structure_detail::Candidate& a,
-               const default_structure_detail::Candidate& b) {
-    return a.score > b.score;
-  });
-
-  if (!families[0].valid)
+  // Tier 2: inferred fixed-record context. Four windows must independently
+  // select exactly the same stride; no transpose/delta transform is allowed.
+  if (blockSize < routed::kStatisticalRoutingMinimumBytes)
     return fallback;
-  constexpr double minimumDecisionScore = 0.060;
-  constexpr double minimumWinningMargin = 0.040;
-  const double runnerUpScore = families[1].valid ? families[1].score : 0.0;
-  if (families[0].score < minimumDecisionScore ||
-      families[0].score - runnerUpScore < minimumWinningMargin)
+  const uint64_t interiorSpan = blockSize - windowSize;
+  const uint64_t thirdOffset = (interiorSpan / 3) & ~uint64_t{7};
+  const uint64_t fourthOffset = ((interiorSpan / 3) * 2) & ~uint64_t{7};
+  if (thirdOffset < windowSize || fourthOffset < thirdOffset + windowSize ||
+      secondOffset < fourthOffset + windowSize)
+    return fallback;
+
+  std::vector<uint8_t> third;
+  std::vector<uint8_t> fourth;
+  if (!default_structure_detail::readWindow(
+        in, blockStart + thirdOffset, windowSize, third) ||
+      !default_structure_detail::readWindow(
+        in, blockStart + fourthOffset, windowSize, fourth))
+    return fallback;
+
+  const routed::StrideFeature firstRecord = routed::inferRecordStride(first);
+  const routed::StrideFeature secondRecord = routed::inferRecordStride(second);
+  const routed::StrideFeature thirdRecord = routed::inferRecordStride(third);
+  const routed::StrideFeature fourthRecord = routed::inferRecordStride(fourth);
+  if (!firstRecord.valid || !secondRecord.valid || !thirdRecord.valid ||
+      !fourthRecord.valid || firstRecord.stride != secondRecord.stride ||
+      firstRecord.stride != thirdRecord.stride ||
+      firstRecord.stride != fourthRecord.stride)
     return fallback;
 
   SecondaryDecision decision;
-  decision.type = families[0].type;
-  decision.info = families[0].info;
-  decision.estimatedGainBpb = families[0].gain;
+  decision.type = BlockType::RECORD;
+  decision.info = structured::packRecordInfo(
+    firstRecord.stride, structured::RecordTransform::MODEL_ONLY);
+  decision.estimatedGainBpb = 0.0;
+  const uint16_t stride = structured::unpackRecordStride(decision.info);
+  decision.route.pipeline = {routed::ProfileId::RECORD_STRIDE_CTX, 1, 0};
+  decision.route.evidence = routed::EvidenceKind::STATISTICAL_INFERENCE;
+  decision.route.statePolicy = routed::StatePolicy::CONTINUE_LOCAL;
+  decision.route.expert = routed::ExpertId::PAQ_RECORD;
+  decision.route.transform = routed::TransformId::NONE;
+  routed::RecordParams recordParams;
+  recordParams.stride = stride;
+  decision.route.parameters = routed::encodeRecordParams(recordParams);
+  decision.route.reasonCode = 0x02000001u;
+  decision.route.scoreQ8 = std::min(
+    std::min(firstRecord.scoreQ8, secondRecord.scoreQ8),
+    std::min(thirdRecord.scoreQ8, fourthRecord.scoreQ8));
+  decision.route.selected = true;
+  if (!routed::ProfileRegistry::validateAutomaticDecision(decision.route, blockSize))
+    return fallback;
   return decision;
 }

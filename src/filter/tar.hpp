@@ -3,7 +3,12 @@
 #include "Filter.hpp"
 #include "../file/File.hpp"
 #include "../CharacterNames.hpp"
+
+#include <array>
+#include <climits>
+#include <cstddef>
 #include <cstdint>
+#include <limits>
 
 /**
  * UStar (Unix Standard TAR) detection and transformation
@@ -32,7 +37,7 @@ private:
     char padding[12];     // 500 | padding
 
     int oct2bin(const char* p, int size) {
-      while (*p == SPACE) { //skip leading spaces
+      while (size > 0 && *p == SPACE) { //skip leading spaces
         ++p;
         --size;
       }
@@ -44,8 +49,11 @@ private:
           break;
         if (*p < '0' || *p > '7')
           return -1; //fail
+        const int digit = *p - '0';
+        if (i > (INT_MAX - digit) / 8)
+          return -1; // value is not representable by the decoder
         i *= 8;
-        i += *p - '0';
+        i += digit;
         ++p;
         --size;
       }
@@ -76,7 +84,7 @@ private:
       //information about the format (see the checksum format examples above).
       char filler = chksum[0] == SPACE ? SPACE : '0';
       int i = 0;
-      for (; i < sizeof(tarh.chksum); i++)
+      for (; i + 1 < static_cast<int>(sizeof(tarh.chksum)); i++)
         if (chksum[i + 1] == 0) break;
       //now i points to the last digit of the checksum
       for (; i >= 0; i--)
@@ -87,7 +95,7 @@ private:
       //look up the terminating \0 and fill it's left side with the checksum (octal)
       int checksum = calculateChecksum();
       int i = 0;
-      for (; i < sizeof(tarh.chksum); i++)
+      for (; i + 1 < static_cast<int>(sizeof(tarh.chksum)); i++)
         if (chksum[i + 1] == 0) break;
       //now i points to the last digit of the checksum
       for (; i >= 0; i--) {
@@ -116,6 +124,41 @@ private:
   Array<uint64_t> detectedFileStartPositions{ 0 };
   Array<uint64_t> detectedFileLengths{ 0 };
   uint64_t detectedEmptySectorCount{ 0 };
+
+  static constexpr uint64_t kMaximumRestoredBlockBytes = UINT32_MAX;
+  static constexpr size_t kDecodeCopyBufferBytes = 16u * 1024u;
+
+  static bool readCanonicalVli(File* input, uint64_t endPosition,
+                               uint64_t& value) {
+    value = 0;
+    for (unsigned index = 0; index < 10; ++index) {
+      if (input->curPos() >= endPosition)
+        return false;
+      const int next = input->getchar();
+      if (next == EOF)
+        return false;
+      const uint8_t byte = static_cast<uint8_t>(next);
+      if (index == 9) {
+        if ((byte & 0x80u) != 0 || (byte & 0x7fu) > 1)
+          return false;
+        value |= static_cast<uint64_t>(byte & 1u) << 63;
+      }
+      else {
+        value |= static_cast<uint64_t>(byte & 0x7fu) << (index * 7);
+      }
+      if ((byte & 0x80u) == 0)
+        return index == 0 || (byte & 0x7fu) != 0;
+    }
+    return false;
+  }
+
+  static bool checkedAddWithin(uint64_t value, uint64_t add,
+                               uint64_t limit, uint64_t& result) {
+    if (value > limit || add > limit - value)
+      return false;
+    result = value + add;
+    return true;
+  }
 
   //detect tar content
   //a tar file is: hdr+filecontent + hdr+filecontent + etc...
@@ -247,91 +290,126 @@ public:
   }
 
   uint64_t decode(File* in, File* out, FMode fMode, uint64_t size, uint64_t& diffFound) override {
-    size_t sectorCount = in->getVLI();
-    size_t emptySectorCount = in->getVLI();
-    size_t curPos = in->curPos();
-    Array<TARheader, 1> headerData{ sectorCount };
-    Array<uint8_t, 1> fileData{ 0 };
+    const uint64_t inputStart = in->curPos();
+    if (inputStart > std::numeric_limits<uint64_t>::max() - size)
+      quit("Corrupted TAR transform: input range overflows.");
+    const uint64_t inputEnd = inputStart + size;
+
+    uint64_t sectorCount64 = 0;
+    uint64_t emptySectorCount = 0;
+    if (!readCanonicalVli(in, inputEnd, sectorCount64) ||
+        !readCanonicalVli(in, inputEnd, emptySectorCount))
+      quit("Corrupted TAR transform: invalid count header.");
+    const uint64_t headerStart = in->curPos();
+    if (sectorCount64 > std::numeric_limits<size_t>::max() ||
+        sectorCount64 > kMaximumRestoredBlockBytes / sizeof(TARheader) ||
+        headerStart > inputEnd ||
+        sectorCount64 > (inputEnd - headerStart) / sizeof(TARheader))
+      quit("Corrupted TAR transform: header table is too large.");
+    const size_t sectorCount = static_cast<size_t>(sectorCount64);
+    const uint64_t headerBytes = sectorCount64 * sizeof(TARheader);
+    uint64_t fileDataStartPos = headerStart + headerBytes;
+
+    std::array<uint8_t, kDecodeCopyBufferBytes> fileData{};
+    std::array<uint8_t, kDecodeCopyBufferBytes> zeroData{};
     uint64_t p = 0;
-    uint64_t fileDataStartPos = curPos + sectorCount * sizeof(tarh);
     for (size_t i = 0; i < sectorCount; i++) {
-      in->setpos(curPos + i * sizeof(tarh));
-      int bytesRead = in->blockRead((uint8_t*)&headerData[i], sizeof(tarh));
-      if (bytesRead != sizeof(tarh)) {
-        if (fMode == FMode::FCOMPARE)
-          diffFound = p + 1;
-        return 0;
-      }
-      headerData[i].generateChecksum();
+      in->setpos(headerStart + static_cast<uint64_t>(i) * sizeof(TARheader));
+      if (in->blockRead(reinterpret_cast<uint8_t*>(&tarh), sizeof(tarh)) !=
+          sizeof(tarh))
+        quit("Corrupted TAR transform: truncated header table.");
+      tarh.generateChecksum();
+      const int parsedFileSize = tarh.oct2bin(tarh.size, sizeof(tarh.size));
+      if (parsedFileSize < 0)
+        quit("Corrupted TAR transform: invalid file size.");
+      const uint64_t fileSize = static_cast<uint64_t>(parsedFileSize);
+
+      uint64_t afterHeader = 0;
+      if (!checkedAddWithin(p, sizeof(tarh), kMaximumRestoredBlockBytes,
+                            afterHeader))
+        quit("Corrupted TAR transform: restored block is too large.");
 
       if (fMode == FMode::FDECOMPRESS) {
-        p += sizeof(tarh);
-        out->blockWrite((uint8_t*)&headerData[i], sizeof(tarh));
+        out->blockWrite(reinterpret_cast<uint8_t*>(&tarh), sizeof(tarh));
       }
       else if (fMode == FMode::FCOMPARE) {
         for (int j = 0; j < sizeof(tarh); j++) {
-          p++;
           int c1 = out->getchar();
-          int c2 = ((uint8_t*)&headerData[i])[j];
+          int c2 = reinterpret_cast<uint8_t*>(&tarh)[j];
           if (c1 != c2 && (diffFound == 0)) {
-            diffFound = p;
+            diffFound = p + static_cast<uint64_t>(j) + 1;
           }
         }
       }
+      p = afterHeader;
 
-      int fileSize = tarh.oct2bin(headerData[i].size, 12);
-      
       if (fileSize != 0) {
+        if (fileDataStartPos > inputEnd ||
+            fileSize > inputEnd - fileDataStartPos)
+          quit("Corrupted TAR transform: file data exceeds transformed input.");
         in->setpos(fileDataStartPos);
-        fileData.resize(fileSize);
-        int bytesRead = in->blockRead(&fileData[0], fileSize);
-        if (bytesRead != fileSize) {
-          if (fMode == FMode::FCOMPARE)
-            diffFound = p;
-          return p;
-        }
-        if (fMode == FMode::FDECOMPRESS) {
-          p += fileSize;
-          out->blockWrite(&fileData[0], fileSize);
-        }
-        else if (fMode == FMode::FCOMPARE) {
-          for (int j = 0; j < fileSize; j++) {
-            p++;
-            if (fileData[j] != out->getchar() && (diffFound == 0)) {
-              diffFound = p;
-            }
-          }
-        }
-        fileDataStartPos += fileSize;
-        //printf("filesize (%d): %d\n",int(i), int(fileSize));
-        
-        //padding sector with 0 when needed
-        while ((fileSize & 511) != 0) {
-          p++;
-          fileSize++;
+        uint64_t remainingFileBytes = fileSize;
+        while (remainingFileBytes != 0) {
+          const uint64_t request = remainingFileBytes < fileData.size()
+            ? remainingFileBytes : fileData.size();
+          if (in->blockRead(fileData.data(), request) != request)
+            quit("Corrupted TAR transform: truncated file data.");
           if (fMode == FMode::FDECOMPRESS) {
-            out->putChar(0);
+            out->blockWrite(fileData.data(), request);
           }
           else if (fMode == FMode::FCOMPARE) {
-            if (out->getchar() != 0 && (diffFound == 0)) {
-              diffFound = p;
+            for (uint64_t j = 0; j < request; ++j) {
+              if (fileData[static_cast<size_t>(j)] != out->getchar() &&
+                  diffFound == 0)
+                diffFound = p + j + 1;
             }
           }
+          if (!checkedAddWithin(p, request, kMaximumRestoredBlockBytes, p))
+            quit("Corrupted TAR transform: restored block is too large.");
+          remainingFileBytes -= request;
+        }
+        fileDataStartPos += fileSize;
+
+        uint64_t padding = (sizeof(tarh) - (fileSize & 511u)) & 511u;
+        while (padding != 0) {
+          const uint64_t request = padding < zeroData.size()
+            ? padding : zeroData.size();
+          if (fMode == FMode::FDECOMPRESS) {
+            out->blockWrite(zeroData.data(), request);
+          }
+          else if (fMode == FMode::FCOMPARE) {
+            for (uint64_t j = 0; j < request; ++j) {
+              if (out->getchar() != 0 && diffFound == 0)
+                diffFound = p + j + 1;
+            }
+          }
+          if (!checkedAddWithin(p, request, kMaximumRestoredBlockBytes, p))
+            quit("Corrupted TAR transform: restored block is too large.");
+          padding -= request;
         }
       }
     }
 
-    //write empty sectors at the end
-    for (size_t i = 0; i < emptySectorCount * sizeof(tarh); i++) {
-      p++;
+    if (fileDataStartPos != inputEnd)
+      quit("Corrupted TAR transform: unexpected trailing transformed data.");
+    if (emptySectorCount >
+        (kMaximumRestoredBlockBytes - p) / sizeof(tarh))
+      quit("Corrupted TAR transform: empty-sector run is too large.");
+    uint64_t emptyBytes = emptySectorCount * sizeof(tarh);
+    while (emptyBytes != 0) {
+      const uint64_t request = emptyBytes < zeroData.size()
+        ? emptyBytes : zeroData.size();
       if (fMode == FMode::FDECOMPRESS) {
-        out->putChar(0);
+        out->blockWrite(zeroData.data(), request);
       }
       else if (fMode == FMode::FCOMPARE) {
-        if (out->getchar() != 0 && (diffFound == 0)) {
-          diffFound = p;
+        for (uint64_t j = 0; j < request; ++j) {
+          if (out->getchar() != 0 && diffFound == 0)
+            diffFound = p + j + 1;
         }
       }
+      p += request; // Prevalidated against kMaximumRestoredBlockBytes above.
+      emptyBytes -= request;
     }
 
     in->setpos(fileDataStartPos);
@@ -341,23 +419,32 @@ public:
 
   void getFilePositions(File* in, Array<uint64_t,1> &filePositions) {
     assert(filePositions.size() == 0);
-    size_t sectorCount = in->getVLI();
-    size_t emptySectorCount = in->getVLI();
-    size_t curPos = in->curPos();
+    const uint64_t sectorCount = in->getVLI();
+    const uint64_t emptySectorCount = in->getVLI();
+    const uint64_t curPos = in->curPos();
+    if (sectorCount > (std::numeric_limits<uint64_t>::max() - curPos) /
+                        sizeof(tarh))
+      quit("Internal TAR planning header range overflow.");
     uint64_t fileDataStartPos = curPos + sectorCount * sizeof(tarh);
     filePositions.pushBack(fileDataStartPos); //the first entry is the first file position
-    for (size_t i = 0; i < sectorCount; i++) {
+    for (uint64_t i = 0; i < sectorCount; i++) {
       int bytesRead = in->blockRead((uint8_t*)&tarh, sizeof(tarh));
-      assert(bytesRead == sizeof(tarh));
+      if (bytesRead != sizeof(tarh))
+        quit("Internal TAR planning header table is truncated.");
 
       int fileSize = tarh.oct2bin(tarh.size, 12);
-      assert(fileSize >= 0);
+      if (fileSize < 0)
+        quit("Internal TAR planning file size is invalid.");
 
       if (fileSize != 0) {
+        if (static_cast<uint64_t>(fileSize) >
+            std::numeric_limits<uint64_t>::max() - fileDataStartPos)
+          quit("Internal TAR planning file range overflow.");
         fileDataStartPos += fileSize;
         filePositions.pushBack(fileDataStartPos); //the last entry is exactly the tempfile size (it points past to the last file)
       }
     }
+    (void)emptySectorCount; // Empty sectors are reconstructed, not stored.
   }
 
 };

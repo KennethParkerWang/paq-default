@@ -3,8 +3,42 @@
 #include "Filter.hpp"
 #include "../VLI.hpp"
 
+#include <cstddef>
+#include <cstdint>
+
 class RleFilter : Filter {
 private:
+
+  static bool readCanonicalVli(File* in, uint64_t inputSize,
+                               uint64_t& bytesRead, uint64_t& value) {
+    bytesRead = 0;
+    value = 0;
+    for (unsigned index = 0; index < 10; ++index) {
+      if (bytesRead >= inputSize)
+        return false;
+      const int next = in->getchar();
+      if (next == EOF)
+        return false;
+      const uint8_t byte = static_cast<uint8_t>(next);
+      ++bytesRead;
+
+      // A uint64_t VLI has at most one payload bit in its tenth byte.
+      if (index == 9) {
+        if ((byte & 0x80u) != 0 || (byte & 0x7fu) > 1)
+          return false;
+        value |= static_cast<uint64_t>(byte & 1u) << 63;
+      }
+      else {
+        value |= static_cast<uint64_t>(byte & 0x7fu) << (index * 7);
+      }
+
+      if ((byte & 0x80u) == 0) {
+        // putVLI() always uses the shortest representation.
+        return index == 0 || (byte & 0x7fu) != 0;
+      }
+    }
+    return false;
+  }
 
   int scanLineSize = 0;
 
@@ -89,16 +123,32 @@ public:
     }
   }
 
-  uint64_t decode(File *in, File *out, FMode fMode, uint64_t  /*size*/, uint64_t &diffFound) override {
+  uint64_t decode(File *in, File *out, FMode fMode, uint64_t size, uint64_t &diffFound) override {
     uint8_t inBuffer[0x10000] = {0};
-    uint8_t outBuffer[0x10200] = {0};
     uint64_t pos = 0;
-    scanLineSize = static_cast<int>(in->getVLI());
+    uint64_t vliBytes = 0;
+    uint64_t archivedScanLineSize = 0;
+    if (!readCanonicalVli(in, size, vliBytes, archivedScanLineSize) ||
+        archivedScanLineSize == 0 || archivedScanLineSize > sizeof(inBuffer))
+      quit("Corrupted RLE transform: invalid scan-line size.");
+    scanLineSize = static_cast<int>(archivedScanLineSize);
+    if (vliBytes == size)
+      quit("Corrupted RLE transform: missing scan-line data.");
 
-    do {
-      uint64_t remaining = in->blockRead(&inBuffer[0], scanLineSize);
+    // In the worst case each source byte starts a two-byte run packet.  The
+    // former fixed 0x10200-byte buffer was smaller than that proven bound.
+    Array<uint8_t, 1> outBuffer(archivedScanLineSize * 2 + 2);
+    uint64_t inputRemaining = size - vliBytes;
+
+    while (inputRemaining != 0) {
+      const uint64_t request = inputRemaining < archivedScanLineSize
+        ? inputRemaining : archivedScanLineSize;
+      uint64_t remaining = in->blockRead(&inBuffer[0], request);
+      if (remaining != request)
+        quit("Corrupted RLE transform: truncated scan-line data.");
+      inputRemaining -= remaining;
       uint8_t *inPtr = (uint8_t *) inBuffer;
-      uint8_t *outPtr = (uint8_t *) outBuffer;
+      uint8_t *outPtr = &outBuffer[0];
       uint8_t *lastLiteral = nullptr;
       state = RleState::BASE;
       while( remaining > 0 ) {
@@ -126,19 +176,20 @@ public:
         } while( loop != 0 );
       }
 
-      uint64_t length = outPtr - (&outBuffer[0]);
+      uint64_t length = static_cast<uint64_t>(outPtr - &outBuffer[0]);
+      if (length > outBuffer.size())
+        quit("Corrupted RLE transform: expanded scan line is too large.");
       if( fMode == FMode::FDECOMPRESS ) {
         out->blockWrite(&outBuffer[0], length);
       } else if( fMode == FMode::FCOMPARE ) {
-        for(uint32_t j = 0; j < length; ++j ) {
+        for(uint64_t j = 0; j < length; ++j ) {
           if( outBuffer[j] != out->getchar() && (diffFound == 0)) {
             diffFound = pos + j + 1;
-            break;
           }
         }
       }
       pos += length;
-    } while( !in->eof() && (diffFound == 0));
+    }
     return pos;
   }
 };

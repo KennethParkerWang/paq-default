@@ -1,5 +1,6 @@
 #include <cstdint>
 #include "BlockType.hpp"
+#include "filter/StructuredDataFilter.hpp"
 
 bool hasRecursion(BlockType ft) {
   return ft == BlockType::CD || ft == BlockType::ZLIB || ft == BlockType::BASE64 || ft == BlockType::BASE85 || ft == BlockType::GIF || ft == BlockType::RLE || ft == BlockType::LZW || ft == BlockType::PNG8 || ft == BlockType::PNG8GRAY || ft == BlockType::PNG24 || ft == BlockType::PNG32 || ft == BlockType::TAR;
@@ -21,7 +22,11 @@ bool hasTransform(BlockType ft, int info) {
     // enter transform dispatch, where metadata validation rejects the archive.
     return ((static_cast<uint32_t>(info) >> 12) & 3U) != 0;
   }
-  if (ft == BlockType::NUMERIC || ft == BlockType::WIDE_TEXT)
+  if (ft == BlockType::WIDE_TEXT) {
+    return structured::unpackWideTextTransform(static_cast<uint32_t>(info)) ==
+           structured::WideTextTransform::BYTE_SHUFFLE;
+  }
+  if (ft == BlockType::NUMERIC)
     return true;
   return ft == BlockType::IMAGE24 || ft == BlockType::IMAGE32 || ft == BlockType::AUDIO_LE || ft == BlockType::EXE || ft == BlockType::CD || ft == BlockType::ZLIB || ft == BlockType::BASE64 || ft == BlockType::BASE85 || ft == BlockType::GIF ||
     ft == BlockType::TEXT_EOL || ft == BlockType::RLE || ft == BlockType::LZW || ft == BlockType::DEC_ALPHA || ft == BlockType::PNG8 || ft == BlockType::PNG8GRAY || ft == BlockType::PNG24 || ft == BlockType::PNG32 || ft == BlockType::TAR;

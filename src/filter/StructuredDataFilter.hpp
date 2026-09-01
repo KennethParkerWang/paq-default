@@ -33,6 +33,11 @@ enum class NumericTransform : uint8_t {
   LORENZO_SHUFFLE = 4,
 };
 
+enum class WideTextTransform : uint8_t {
+  BYTE_SHUFFLE = 0,
+  MODEL_ONLY = 1,
+};
+
 struct RecordInfo {
   uint16_t stride{};
   RecordTransform transform{RecordTransform::MODEL_ONLY};
@@ -47,6 +52,7 @@ struct NumericInfo {
 
 struct WideTextInfo {
   uint8_t elementBytes{};
+  WideTextTransform transform{WideTextTransform::BYTE_SHUFFLE};
 };
 
 // RECORD blockInfo:
@@ -209,9 +215,11 @@ inline NumericTransform unpackNumericTransform(const uint32_t info) {
 
 // WIDE_TEXT blockInfo:
 //   bits 0..2 : elementBytes stored as its actual value (2 or 4)
-//   bits 3..31: zero
+//   bit  3    : WideTextTransform (0 keeps v217 byte-shuffle semantics)
+//   bits 4..31: zero
 constexpr uint32_t kWideTextElementBytesMask = 0x00000007u;
-constexpr uint32_t kWideTextReservedMask = 0xFFFFFFF8u;
+constexpr uint32_t kWideTextTransformMask = 0x00000008u;
+constexpr uint32_t kWideTextReservedMask = 0xFFFFFFF0u;
 
 inline bool isValidWideTextInfo(const uint32_t info) {
   const uint32_t elementBytes = info & kWideTextElementBytesMask;
@@ -225,8 +233,11 @@ inline void validateWideTextInfo(const uint32_t info) {
   }
 }
 
-inline uint32_t packWideTextInfo(const uint8_t elementBytes) {
-  const uint32_t info = elementBytes;
+inline uint32_t packWideTextInfo(
+    const uint8_t elementBytes,
+    const WideTextTransform transform = WideTextTransform::BYTE_SHUFFLE) {
+  const uint32_t info = elementBytes |
+    (static_cast<uint32_t>(transform) << 3);
   validateWideTextInfo(info);
   return info;
 }
@@ -235,11 +246,17 @@ inline WideTextInfo unpackWideTextInfo(const uint32_t info) {
   validateWideTextInfo(info);
   WideTextInfo result;
   result.elementBytes = static_cast<uint8_t>(info & kWideTextElementBytesMask);
+  result.transform = static_cast<WideTextTransform>(
+    (info & kWideTextTransformMask) >> 3);
   return result;
 }
 
 inline uint8_t unpackWideTextElementBytes(const uint32_t info) {
   return unpackWideTextInfo(info).elementBytes;
+}
+
+inline WideTextTransform unpackWideTextTransform(const uint32_t info) {
+  return unpackWideTextInfo(info).transform;
 }
 
 inline bool isStructuredType(const BlockType type) {

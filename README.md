@@ -1,26 +1,37 @@
 ﻿# PAQ8PX – Experimental Lossless Data Compressor & Entropy Estimator
 
-> **Derived structured-DEFAULT branch.** This directory is an isolated v216
-> derivative whose executable/archive identity is `paq8pxsd217`. It adds
-> conservative RECORD, NUMERIC, and WIDE_TEXT handling. These archives are not
-> bitstream-compatible with paq8px v216; use the matching derived decoder.
-> The implementation was initially delivered under a static-review-only
-> constraint. Later authorized checks passed an exact 1024-byte round trip and
-> 24/24 original/derived Silesia leading-prefix round trips. RECORD was exercised
-> twice; NUMERIC and WIDE_TEXT remain unexercised. The Silesia aggregate regressed
-> because of an `x-ray` RECORD false positive; see
-> `verification/silesia/EXP01-paq8pxsd-v217-32KiB/RESULTS.md`.
+> **Derived routed-profile branch.** This repository is an isolated PAQ8px v216
+> derivative. Its executable identity is `paq8pxhy` v219 and its default archive
+> suffix is `.paq8pxhy219`. The native routed-v2 archive records every decoder
+> decision and reconstructs the original single-file byte stream in source
+> order. It is not bitstream-compatible with upstream PAQ8px v216; retain the
+> matching decoder with every archive.
+
+Eligible single-file compression at levels 1-12 uses the native routed path.
+ZIP/ZIP64 stored-member regions, x86/x64 PE/ELF/thin-Mach-O code regions, and
+the exact Silesia SAO schema can be routed to their frozen handlers; every
+unsupported, ambiguous, dependency-disabled, or uncalibrated region falls back
+to PAQ. Level 0, multiple-file mode, LSTM/training options, and external model
+state retain the complete legacy-archive carriage path.
 
 ## Derived branch quick start
 
-After building this source, the derived executable is `paq8pxsd` (or
-`paq8pxsd.exe` on Windows). Its default archive suffix is `.paq8pxsd217`:
+The canonical full build uses CMake with `ENABLE_OPENZL=ON`. Direct Visual
+Studio and manual compiler-script builds are intentionally PAQ-only and print a
+startup warning; SAO then falls back to PAQ.
 
 ```text
-paq8pxsd -8 input-file
-paq8pxsd -d input-file.paq8pxsd217
-paq8pxsd -help
+cmake -S . -B build-routed -DENABLE_OPENZL=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build-routed --config Release
+paq8pxhy -8 input-file
+paq8pxhy -d input-file.paq8pxhy219
+paq8pxhy -help
 ```
+
+This routed-v2 implementation has received static source review only: it has
+not been compiled, executed, round-trip tested, or benchmarked under the current
+no-test instruction. Earlier structured-DEFAULT v217 experiments are retained
+under `verification/` as historical evidence and do not validate routed-v2.
 
 The remainder of this README is retained from upstream v216 as historical and
 general PAQ documentation. Commands and `.paq8px216` names below refer to the
@@ -457,23 +468,21 @@ If you use pre-trained LSTM repositories, ensure the same RNN weight files (`eng
 <a id="compile"></a>
 ## How to compile
 
-Building `paq8px` requires a `C++17` capable `C++` compiler:  
-[https://en.cppreference.com/w/cpp/compiler_support#cpp17](https://en.cppreference.com/w/cpp/compiler_support#cpp17)
+Building `paq8pxhy` requires a C++17-capable compiler. The canonical routed
+build is CMake with OpenZL enabled:
 
-**Windows:**  
-On Windows, you can download a prebuilt executable instead of compiling it yourself.  
-Just grab the executable from the [latest release](/releases/latest), or alternatively from one of the release announcement posts in the [paq8px thread](https://encode.su/threads/342-paq8px/) on the encode.su forum.  
-If you would like to build an executable yourself you may use the Visual Studio solution file or in case of Mingw-w64 see the `build-mingw-w64-generic-publish.cmd` batch file in the build subfolder.
-
-**Linux/macOS:**  
-The ./build folder already contains helper scripts.  
-You may use the following commands to build with cmake:
-
+```text
+cmake -S . -B build-routed -DENABLE_OPENZL=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build-routed --config Release
 ```
-sudo apt-get install build-essential zlib1g-dev cmake make
-cd build
-./build-linux-with-cmake.sh
-```
+
+CMake fetches the pinned OpenZL v0.2.0 dependency for the complete SAO expert
+profile. `build/build-linux-with-cmake.sh` invokes this full configuration.
+
+The Visual Studio solution, MinGW batch file, and direct GCC/Clang shell scripts
+remain compatibility builds without OpenZL. They define
+`PAQ_DIRECT_VCXPROJ_BUILD=1`, produce `paq8pxhy`, and print an explicit startup
+warning that SAO routing is disabled and falls back to PAQ.
 
 ### Testing in a Linux VM
 
@@ -485,7 +494,9 @@ sudo apt update
 sudo apt install gcc clang gcc-aarch64-linux-gnu g++-aarch64-linux-gnu build-essential cmake zlib1g-dev
 ```
 
-Sample build scripts are provided in the build/ folder:
+Sample build scripts are provided in the build/ folder. Only the CMake helper
+enables the complete OpenZL profile; the others are PAQ-only compatibility
+builds:
 - `build/build-linux-with-cmake.sh`
 - `build/build-linux-with-gcc.sh`
 - `build/build-linux-with-clang.sh`
@@ -493,7 +504,8 @@ Sample build scripts are provided in the build/ folder:
 
 ### Tested toolchains
 
-The following compiler/OS combinations have been tested successfully:
+The following compiler/OS combinations are inherited upstream history. They do
+not constitute a build claim for the current routed-v2 source:
 
 | Version | OS                             | Compiler/IDE                                                  |
 |---------|--------------------------------|---------------------------------------------------------------|

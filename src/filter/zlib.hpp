@@ -261,32 +261,53 @@ static int decodeZlib(File *in, uint64_t size, File *out, FMode mode, uint64_t &
   const int limit = 128;
   uint8_t zin[block];
   uint8_t zOut[block];
-  int diffCount = min(in->getchar(), limit - 1);
-  int window = in->getchar() - MAX_WBITS;
-  int index = in->getchar();
+  if (in == nullptr || out == nullptr || size < 7)
+    quit("Corrupted ZLIB transform header.");
+  const int diffCount = in->getchar();
+  const int archivedWindow = in->getchar();
+  const int index = in->getchar();
+  if (diffCount < 0 || diffCount >= limit || archivedWindow < 0 ||
+      index < 0 || index >= 81 ||
+      (archivedWindow != 0 &&
+       (archivedWindow < MAX_WBITS + 10 ||
+        archivedWindow > MAX_WBITS + 15)))
+    quit("Corrupted ZLIB transform parameters.");
+  const uint64_t headerSize = 7u + 5u * static_cast<uint64_t>(diffCount);
+  if (headerSize > size)
+    quit("Corrupted ZLIB transform header length.");
+  const int window = archivedWindow - MAX_WBITS;
   int memLevel = (index % 9) + 1;
   int cLevel = (index / 9) + 1;
-  int len = 0;
-  int diffPos[limit];
+  int64_t restoredLength = 0;
+  int64_t diffPos[limit];
   diffPos[0] = -1;
   for( int i = 0; i <= diffCount; i++ ) {
-    int v = in->get32();
+    const uint32_t archivedDelta = in->get32();
     if( i == diffCount ) {
-      len = v + diffPos[i];
+      restoredLength = diffPos[i] + archivedDelta;
+      if (restoredLength <= diffPos[i] || restoredLength > INT32_MAX)
+        quit("Corrupted ZLIB restored length.");
     } else {
-      diffPos[i + 1] = v + diffPos[i] + 1;
+      const uint64_t candidate = static_cast<uint64_t>(diffPos[i] + 1) +
+                                 archivedDelta;
+      if (candidate > INT32_MAX)
+        quit("Corrupted ZLIB difference position.");
+      diffPos[i + 1] = static_cast<int64_t>(candidate);
     }
   }
   uint8_t diffByte[limit];
   diffByte[0] = 0;
   for( int i = 0; i < diffCount; i++ ) {
-    diffByte[i + 1] = in->getchar();
+    const int c = in->getchar();
+    if (c == EOF)
+      quit("Corrupted ZLIB difference table.");
+    diffByte[i + 1] = static_cast<uint8_t>(c);
   }
-  size -= 7 + 5 * diffCount;
+  size -= headerSize;
 
   z_stream recStrm;
   int diffIndex = 1;
-  int recPos = 0;
+  int64_t recPos = 0;
   recStrm.zalloc = Z_NULL;
   recStrm.zfree = Z_NULL;
   recStrm.opaque = Z_NULL;
@@ -294,39 +315,69 @@ static int decodeZlib(File *in, uint64_t size, File *out, FMode mode, uint64_t &
   recStrm.avail_in = 0;
   int ret = deflateInit2(&recStrm, cLevel, Z_DEFLATED, window, memLevel, Z_DEFAULT_STRATEGY);
   if( ret != Z_OK ) {
-    return 0;
+    quit("Corrupted ZLIB transform cannot initialize its archived parameters.");
   }
-  for( uint64_t i = 0; i < size; i += block ) {
-    uint32_t blSize = min(uint32_t(size - i), block);
-    in->blockRead(&zin[0], blSize);
-    recStrm.next_in = &zin[0];
+  auto failAfterInit = [&](const char* message) {
+    deflateEnd(&recStrm);
+    quit(message);
+  };
+  // Execute at least one Z_FINISH call. A valid transformed payload may have
+  // zero bytes when the original DEFLATE stream represents empty input, but
+  // its zlib wrapper still has bytes that must be reconstructed.
+  uint64_t inputOffset = 0;
+  do {
+    const uint32_t blSize = static_cast<uint32_t>(
+      std::min<uint64_t>(size - inputOffset, block));
+    if (blSize != 0 && in->blockRead(&zin[0], blSize) != blSize)
+      failAfterInit("Corrupted ZLIB transform payload is truncated.");
+    recStrm.next_in = blSize == 0 ? Z_NULL : &zin[0];
     recStrm.avail_in = blSize;
+    const bool finalBlock = inputOffset + blSize == size;
     do {
       recStrm.next_out = &zOut[0];
       recStrm.avail_out = block;
-      ret = deflate(&recStrm, i + blSize == size ? Z_FINISH : Z_NO_FLUSH);
+      ret = deflate(&recStrm, finalBlock ? Z_FINISH : Z_NO_FLUSH);
       if( ret != Z_BUF_ERROR && ret != Z_STREAM_END && ret != Z_OK ) {
-        break;
+        failAfterInit("Corrupted ZLIB transform recompression failed.");
       }
-      const int have = min(block - recStrm.avail_out, len - recPos);
-      while( diffIndex <= diffCount && diffPos[diffIndex] >= recPos && diffPos[diffIndex] < recPos + have ) {
-        zOut[diffPos[diffIndex] - recPos] = diffByte[diffIndex];
+      if (ret == Z_STREAM_END &&
+          (!finalBlock || recStrm.avail_in != 0))
+        failAfterInit("Corrupted ZLIB transform has trailing input.");
+      const uint32_t produced = block - recStrm.avail_out;
+      if (recPos > restoredLength)
+        failAfterInit("Corrupted ZLIB transform exceeds its restored length.");
+      // The frozen format stores the original compressed length. A selected
+      // recompression candidate is allowed to produce a longer tail; legacy
+      // encoding records differences only inside that original-length prefix.
+      // Keep driving deflate to STREAM_END, but emit only the contractual
+      // prefix rather than treating the unarchived tail as corruption.
+      const uint32_t kept = static_cast<uint32_t>(std::min<uint64_t>(
+        produced, static_cast<uint64_t>(restoredLength - recPos)));
+      while( diffIndex <= diffCount && diffPos[diffIndex] >= recPos &&
+             diffPos[diffIndex] < recPos + kept ) {
+        zOut[static_cast<size_t>(diffPos[diffIndex] - recPos)] =
+          diffByte[diffIndex];
         diffIndex++;
       }
       if( mode == FMode::FDECOMPRESS ) {
-        out->blockWrite(&zOut[0], have);
+        out->blockWrite(&zOut[0], kept);
       } else if( mode == FMode::FCOMPARE ) {
-        for( int j = 0; j < have; j++ ) {
+        for( uint32_t j = 0; j < kept; j++ ) {
           if( zOut[j] != out->getchar() && (diffFound == 0)) {
             diffFound = recPos + j + 1;
           }
         }
       }
-      recPos += have;
+      recPos += kept;
 
     } while( recStrm.avail_out == 0 );
-  }
+    if (recStrm.avail_in != 0)
+      failAfterInit("Corrupted ZLIB transform input was not consumed.");
+    inputOffset += blSize;
+  } while (inputOffset < size);
   while( diffIndex <= diffCount ) {
+    if (diffPos[diffIndex] != recPos || recPos >= restoredLength)
+      failAfterInit("Corrupted ZLIB trailing difference positions.");
     if( mode == FMode::FDECOMPRESS ) {
       out->putChar(diffByte[diffIndex]);
     } else if( mode == FMode::FCOMPARE ) {
@@ -337,6 +388,8 @@ static int decodeZlib(File *in, uint64_t size, File *out, FMode mode, uint64_t &
     diffIndex++;
     recPos++;
   }
+  if (ret != Z_STREAM_END || recPos != restoredLength)
+    failAfterInit("Corrupted ZLIB transform ended at the wrong length.");
   deflateEnd(&recStrm);
-  return recPos == len ? len : 0;
+  return static_cast<int>(restoredLength);
 }

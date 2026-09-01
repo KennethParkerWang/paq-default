@@ -1082,6 +1082,14 @@ static DetectionInfo detect(File *in, uint64_t blockSize, const TransformOptions
       else if (p == 10) {
         if (mrbPictureType == 6) { // DIB
           uint64_t mrbTell = in->curPos() - 2; //save curPos so we can restore it
+          // The longest legal compressed MRB descriptor below consumes 44
+          // bytes.  File::get32() is intentionally strict, so a short
+          // signature-like suffix is a detector rejection, not a fatal read.
+          if (mrbTell > start + n || start + n - mrbTell < 44) {
+            mrb = 0;
+            in->setpos(mrbTell + 2);
+            continue;
+          }
           in->setpos(mrbTell);
           uint32_t Xdpi = GetCDWord(in);
           uint32_t Ydpi = GetCDWord(in);
@@ -2188,8 +2196,21 @@ static void directEncodeBlock(BlockType type, File *in, uint64_t len, Encoder &e
   fprintf(stderr, "\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b");
 }
 
-static void compressRecursive(File *in, uint64_t blockSize, Encoder &en, String &blstr, float p1, float p2, const TransformOptions* const transformOptions);
-static void compressRecursiveForTar(File* in, uint64_t blockSize, Encoder& en, String& blstr, float p1, float p2, const TransformOptions* const transformOptions);
+constexpr uint32_t kMaximumTransformRecursionDepth = 16;
+constexpr uint64_t kMaximumActiveTransformScratchBytes =
+  (UINT64_C(1) << 31) - 1;
+
+static void compressRecursive(File *in, uint64_t blockSize, Encoder &en,
+                              String &blstr, float p1, float p2,
+                              const TransformOptions* transformOptions,
+                              uint32_t recursionDepth,
+                              uint64_t activeScratchBytes,
+                              bool enforceTransformBudgets);
+static void compressRecursiveForTar(
+  File* in, uint64_t blockSize, Encoder& en, String& blstr, float p1,
+  float p2, const TransformOptions* transformOptions,
+  uint32_t recursionDepth, uint64_t activeScratchBytes,
+  bool enforceTransformBudgets);
 
 static uint64_t decodeFunc(BlockType type, Encoder &en, File *tmp, uint64_t len, int info, File *out, FMode mode, uint64_t &diffFound, const TransformOptions* const transformOptions) {
   if (structured::isStructuredType(type)) {
@@ -2356,7 +2377,13 @@ static uint64_t encodeFunc(BlockType type, File *in, File *tmp, uint64_t len, in
 }
 
 static void
-transformEncodeBlock(BlockType type, File *in, uint64_t len, Encoder &en, int info, String &blstr, float p1, float p2, uint64_t begin, const TransformOptions* const transformOptions) {
+transformEncodeBlock(BlockType type, File *in, uint64_t len, Encoder &en,
+                     int info, String &blstr, float p1, float p2,
+                     uint64_t begin,
+                     const TransformOptions* const transformOptions,
+                     uint32_t recursionDepth,
+                     uint64_t activeScratchBytes,
+                     bool enforceTransformBudgets) {
   // Structured transforms are permutations or unsigned modular predictors.
   // Their inverse is fixed by archived metadata, so deliberately do not use
   // the legacy encode -> decode -> compare adoption probe here.
@@ -2379,21 +2406,35 @@ transformEncodeBlock(BlockType type, File *in, uint64_t len, Encoder &en, int in
     int headerSize = 0;
     uint64_t diffFound = encodeFunc(type, in, &tmp, len, info, headerSize, transformOptions);
     const uint64_t tmpSize = tmp.curPos();
+    const bool recursionBudgetExceeded = enforceTransformBudgets &&
+      hasRecursion(type) &&
+      (recursionDepth >= kMaximumTransformRecursionDepth ||
+       activeScratchBytes > kMaximumActiveTransformScratchBytes ||
+       tmpSize > kMaximumActiveTransformScratchBytes - activeScratchBytes);
     tmp.setpos(tmpSize); //switch to read mode
-    if( diffFound == 0 ) {
+    if( diffFound == 0 && !recursionBudgetExceeded ) {
       tmp.setpos(0);
       en.setFile(&tmp);
       in->setpos(begin);
       decodeFunc(type, en, &tmp, tmpSize, info, in, FMode::FCOMPARE, diffFound, transformOptions);
     }
     // Test fails, compress without transform
-    if( diffFound > 0 || tmp.getchar() != EOF) {
-      printf("Transform fails at %" PRIu64 ", skipping...\n", diffFound - 1);
+    if( recursionBudgetExceeded || diffFound > 0 || tmp.getchar() != EOF) {
+      if (recursionBudgetExceeded)
+        printf("Transform exceeds the frozen recursion resource budget, skipping...\n");
+      else if (diffFound == 0)
+        printf("Transform left trailing transformed bytes, skipping...\n");
+      else
+        printf("Transform fails at %" PRIu64 ", skipping...\n", diffFound - 1);
       in->setpos(begin);
       directEncodeBlock(BlockType::DEFAULT, in, len, en, -1);
     } else {
       tmp.setpos(0);
       if( hasRecursion(type)) {
+        if (headerSize < 0 || static_cast<uint64_t>(headerSize) > tmpSize)
+          quit("Recursive transform returned an invalid header length.");
+        const uint32_t childDepth = recursionDepth + 1;
+        const uint64_t childScratch = activeScratchBytes + tmpSize;
         Block::EncodeBlockHeader(&en, type, tmpSize, info&0xffffff);
         BlockType type2 = static_cast<BlockType>((info >> 24) & 0xFF);
         if (isPNG(type)) {
@@ -2429,13 +2470,20 @@ transformEncodeBlock(BlockType type, File *in, uint64_t len, Encoder &en, int in
             directEncodeBlock(BlockType::HDR, &tmp, headerSize, en, -1);
             printf(" %-11s | --> %s |%10d bytes [%d - %d]\n", blstrSub2.c_str(), dataname, int(tmpSize - headerSize), headerSize, int(tmpSize - 1));
           }
-          transformEncodeBlock(type2, &tmp, tmpSize - headerSize, en, info & 0xffffff, blstr, p1, p2, headerSize, transformOptions);
+          transformEncodeBlock(type2, &tmp, tmpSize - headerSize, en,
+                               info & 0xffffff, blstr, p1, p2, headerSize,
+                               transformOptions, childDepth, childScratch,
+                               enforceTransformBudgets);
         } else {
           if (type == BlockType::TAR) {
-            compressRecursiveForTar(&tmp, tmpSize, en, blstr, p1, p2, transformOptions);
+            compressRecursiveForTar(&tmp, tmpSize, en, blstr, p1, p2,
+                                    transformOptions, childDepth,
+                                    childScratch, enforceTransformBudgets);
           }
           else {
-            compressRecursive(&tmp, tmpSize, en, blstr, p1, p2, transformOptions);
+            compressRecursive(&tmp, tmpSize, en, blstr, p1, p2,
+                              transformOptions, childDepth, childScratch,
+                              enforceTransformBudgets);
           }
         }
       } else {
@@ -2523,20 +2571,32 @@ static void printBlock(const uint64_t begin, const uint64_t len, const BlockType
            static_cast<unsigned>(numericInfo.transform));
   }
   else if (type == BlockType::WIDE_TEXT) {
-    printf(" (%u-byte code units)", static_cast<unsigned>(
-        structured::unpackWideTextElementBytes(static_cast<uint32_t>(blockInfo))));
+    const structured::WideTextInfo wideInfo =
+      structured::unpackWideTextInfo(static_cast<uint32_t>(blockInfo));
+    printf(" (%u-byte code units, mode: %u)",
+           static_cast<unsigned>(wideInfo.elementBytes),
+           static_cast<unsigned>(wideInfo.transform));
   }
   printf("\n");
 }
 
-static void compressBlock(File* in, const uint64_t begin, const uint64_t len, int &blNum, BlockType type, int blockInfo, Encoder& en, String& blstr, float &p1, float &p2, const float pscale, const TransformOptions* const transformOptions) {
+static void compressBlock(File* in, const uint64_t begin, const uint64_t len,
+                          int &blNum, BlockType type, int blockInfo,
+                          Encoder& en, String& blstr, float &p1, float &p2,
+                          const float pscale,
+                          const TransformOptions* const transformOptions,
+                          uint32_t recursionDepth,
+                          uint64_t activeScratchBytes,
+                          bool enforceTransformBudgets) {
   p2 = p1 + pscale * len;
   en.setStatusRange(p1, p2);
 
   String blstrSub;
   composeSubBlockStringToPrint(blstr, blstrSub, blNum);
   printBlock(begin, len, type, blockInfo, blstrSub);
-  transformEncodeBlock(type, in, len, en, blockInfo, blstrSub, p1, p2, begin, transformOptions);
+  transformEncodeBlock(type, in, len, en, blockInfo, blstrSub, p1, p2,
+                       begin, transformOptions, recursionDepth,
+                       activeScratchBytes, enforceTransformBudgets);
   blNum++;
 
   p1 = p2;
@@ -2575,9 +2635,13 @@ static BlockPlan buildBlockPlan(File* in, uint64_t bytesToProcess,
             in, textDetectionInfo.DataStart, textDetectionInfo.DataLength);
         selectedType = secondary.type;
         selectedInfo = static_cast<int>(secondary.info);
+        plan.append(textDetectionInfo.DataStart, textDetectionInfo.DataLength,
+                    selectedType, selectedInfo, secondary.route);
       }
-      plan.append(textDetectionInfo.DataStart, textDetectionInfo.DataLength,
-                  selectedType, selectedInfo);
+      else {
+        plan.append(textDetectionInfo.DataStart, textDetectionInfo.DataLength,
+                    selectedType, selectedInfo);
+      }
       begin += textDetectionInfo.DataLength;
       remaining -= textDetectionInfo.DataLength;
       in->setpos(begin);
@@ -2614,33 +2678,79 @@ static BlockPlan buildBlockPlan(File* in, uint64_t bytesToProcess,
   return plan;
 }
 
-static void encodeBlockPlan(File* in, const BlockPlan& plan, Encoder& en,
-                            String& blstr, float p1, float p2,
-                            const TransformOptions* const transformOptions) {
-  if (!plan.sealed())
-    quit("Cannot encode an unsealed block plan.");
+static void encodeBlockPlanRange(File* in, const BlockPlan& plan,
+                                 size_t firstBlock, size_t blockCount,
+                                 Encoder& en, String& blstr, float p1, float p2,
+                                 const TransformOptions* const transformOptions,
+                                 uint32_t recursionDepth = 0,
+                                 uint64_t activeScratchBytes = 0,
+                                 bool enforceTransformBudgets = false) {
+  plan.validateForEncoding();
 
-  const float pscale = plan.sourceLength() != 0
-    ? (p2 - p1) / plan.sourceLength() : 0;
+  if (firstBlock > plan.size() || blockCount > plan.size() - firstBlock)
+    quit("PAQ block-plan range is outside the sealed plan.");
+
+  uint64_t rangeLength = 0;
+  for (size_t i = 0; i < blockCount; ++i) {
+    const PlannedBlock& block = plan[firstBlock + i];
+    if (rangeLength > std::numeric_limits<uint64_t>::max() - block.sourceLength)
+      quit("PAQ block-plan range length overflow.");
+    rangeLength += block.sourceLength;
+    if (i != 0) {
+      const PlannedBlock& previous = plan[firstBlock + i - 1];
+      if (block.sourceOffset != previous.sourceOffset + previous.sourceLength)
+        quit("PAQ block-plan range is not contiguous.");
+    }
+  }
+
+  const float pscale = rangeLength != 0 ? (p2 - p1) / rangeLength : 0;
   int blNum = 0;
-  for (size_t i = 0; i < plan.size(); ++i) {
-    const PlannedBlock& block = plan[i];
+  for (size_t i = 0; i < blockCount; ++i) {
+    const PlannedBlock& block = plan[firstBlock + i];
     if (block.route != hybrid::RouteId::PAQ_LEGACY_ARCHIVE)
       quit("Stage 3 cannot encode a non-legacy planned route.");
     in->setpos(block.sourceOffset);
     compressBlock(in, block.sourceOffset, block.sourceLength, /*ref: */ blNum,
                   block.legacyType, block.blockInfo, en, /*in: */ blstr,
-                  /*ref: */ p1, /*ref: */ p2, pscale, transformOptions);
+                  /*ref: */ p1, /*ref: */ p2, pscale, transformOptions,
+                  recursionDepth, activeScratchBytes,
+                  enforceTransformBudgets);
   }
+  if (blockCount != 0) {
+    const PlannedBlock& last = plan[firstBlock + blockCount - 1];
+    in->setpos(last.sourceOffset + last.sourceLength);
+  }
+}
+
+static void encodeBlockPlan(File* in, const BlockPlan& plan, Encoder& en,
+                            String& blstr, float p1, float p2,
+                            const TransformOptions* const transformOptions,
+                            uint32_t recursionDepth = 0,
+                            uint64_t activeScratchBytes = 0,
+                            bool enforceTransformBudgets = false) {
+  encodeBlockPlanRange(in, plan, 0, plan.size(), en, blstr, p1, p2,
+                       transformOptions, recursionDepth, activeScratchBytes,
+                       enforceTransformBudgets);
   in->setpos(plan.sourceEnd());
 }
 
-static void compressRecursive(File *in, uint64_t bytesToProcess, Encoder &en, String &blstr, float p1, float p2, const TransformOptions* const transformOptions) {
+static void compressRecursive(File *in, uint64_t bytesToProcess, Encoder &en,
+                              String &blstr, float p1, float p2,
+                              const TransformOptions* const transformOptions,
+                              uint32_t recursionDepth,
+                              uint64_t activeScratchBytes,
+                              bool enforceTransformBudgets) {
   const BlockPlan plan = buildBlockPlan(in, bytesToProcess, transformOptions);
-  encodeBlockPlan(in, plan, en, blstr, p1, p2, transformOptions);
+  encodeBlockPlan(in, plan, en, blstr, p1, p2, transformOptions,
+                  recursionDepth, activeScratchBytes,
+                  enforceTransformBudgets);
 }
 
-static void compressRecursiveForTar(File* in, uint64_t bytesToProcess, Encoder& en, String& blstr, float p1, float p2, const TransformOptions* const transformOptions) {
+static void compressRecursiveForTar(
+    File* in, uint64_t bytesToProcess, Encoder& en, String& blstr,
+    float p1, float p2, const TransformOptions* const transformOptions,
+    uint32_t recursionDepth, uint64_t activeScratchBytes,
+    bool enforceTransformBudgets) {
   Array<uint64_t, 1> filePositions{ 0 };
   TarFilter tarFilter{};
   in->setpos(0);
@@ -2672,7 +2782,9 @@ static void compressRecursiveForTar(File* in, uint64_t bytesToProcess, Encoder& 
     in->setpos(header.sourceOffset);
     compressBlock(in, header.sourceOffset, header.sourceLength, /*ref: */ blNum,
                   header.legacyType, header.blockInfo, en, /*in: */ blstr,
-                  /*ref: */ p1, /*ref: */ p2, pscale, transformOptions);
+                  /*ref: */ p1, /*ref: */ p2, pscale, transformOptions,
+                  recursionDepth, activeScratchBytes,
+                  enforceTransformBudgets);
   }
   for (; planIndex < tarPlan.size(); ++planIndex, ++blNum) {
     const PlannedBlock& member = tarPlan[planIndex];
@@ -2681,7 +2793,9 @@ static void compressRecursiveForTar(File* in, uint64_t bytesToProcess, Encoder& 
     String blstrSub;
     composeSubBlockStringToPrint(blstr, blstrSub, blNum);
     in->setpos(member.sourceOffset);
-    compressRecursive(in, member.sourceLength, en, blstrSub, p1, p2, transformOptions);
+    compressRecursive(in, member.sourceLength, en, blstrSub, p1, p2,
+                      transformOptions, recursionDepth, activeScratchBytes,
+                      enforceTransformBudgets);
     p1 = p2;
   }
   in->setpos(tarPlan.sourceEnd());
@@ -2715,7 +2829,8 @@ static void compressfile(const Shared* const shared, const char *filename, uint6
   }
   else {
     // detect block types + compress
-    compressRecursive(&in, fileSize, en, blstr, 0.0F, 1.0F, &transformOptions);
+    compressRecursive(&in, fileSize, en, blstr, 0.0F, 1.0F,
+                      &transformOptions, 0, 0, false);
   }
   in.close();
 
@@ -2728,15 +2843,27 @@ static void compressfile(const Shared* const shared, const char *filename, uint6
   }
 }
 
-static uint64_t decompressRecursive(File *out, uint64_t blockSize, Encoder &en, FMode mode, TransformOptions *transformOptions) {
+static uint64_t decompressRecursive(
+    File *out, uint64_t blockSize, Encoder &en, FMode mode,
+    TransformOptions *transformOptions, uint32_t recursionDepth = 0,
+    uint64_t activeScratchBytes = 0,
+    bool enforceTransformBudgets = false) {
   uint64_t i = 0;
   uint64_t diffFound = 0;
   while( i < blockSize ) {
 
     uint64_t len = Block::DecodeBlockHeader(&en);
+    if (len == 0)
+      quit("Corrupted archive: zero-length block would make no progress.");
+    const uint64_t remainingOutput = blockSize - i;
     BlockType type = en.getShared()->State.blockType;
     int info = en.getShared()->State.blockInfo;
     if (type == BlockType::MRB) {
+      if (enforceTransformBudgets &&
+          (activeScratchBytes > kMaximumActiveTransformScratchBytes ||
+          len > kMaximumActiveTransformScratchBytes - activeScratchBytes)
+         )
+        quit("Corrupted archive: MRB scratch resource limit exceeded.");
       FileTmp tmp;
       for (uint64_t j = 0; j < len; ++j)
           tmp.putChar(en.decompressByte(en.predictorMain));
@@ -2746,8 +2873,18 @@ static uint64_t decompressRecursive(File *out, uint64_t blockSize, Encoder &en, 
       }
       tmp.close();
     } else if( hasRecursion(type)) {
+      if (enforceTransformBudgets &&
+          recursionDepth >= kMaximumTransformRecursionDepth)
+        quit("Corrupted archive: transform recursion depth exceeded.");
+      if (enforceTransformBudgets &&
+          (activeScratchBytes > kMaximumActiveTransformScratchBytes ||
+           len > kMaximumActiveTransformScratchBytes - activeScratchBytes))
+        quit("Corrupted archive: active transform scratch limit exceeded.");
       FileTmp tmp;
-      decompressRecursive(&tmp, len, en, FMode::FDECOMPRESS, transformOptions);
+      decompressRecursive(&tmp, len, en, FMode::FDECOMPRESS,
+                          transformOptions, recursionDepth + 1,
+                          activeScratchBytes + len,
+                          enforceTransformBudgets);
       if( mode != FMode::FDISCARD ) {
         tmp.setpos(0);
         if( hasTransform(type, info)) {
@@ -2758,6 +2895,8 @@ static uint64_t decompressRecursive(File *out, uint64_t blockSize, Encoder &en, 
     } else if( hasTransform(type, info)) {
       len = decodeFunc(type, en, nullptr, len, info, out, mode, diffFound, transformOptions);
     } else {
+      if (mode != FMode::FDISCARD && len > remainingOutput)
+        quit("Corrupted archive: direct block exceeds its declared boundary.");
       for( uint64_t j = 0; j < len; ++j ) {
         if((j & 0xfff) == 0 ) {
           en.printStatus();
@@ -2774,6 +2913,10 @@ static uint64_t decompressRecursive(File *out, uint64_t blockSize, Encoder &en, 
         }
       }
     }
+    if (len == 0)
+      quit("Corrupted archive: block transform restored an empty span.");
+    if (mode != FMode::FDISCARD && len > remainingOutput)
+      quit("Corrupted archive: block output exceeds its declared boundary.");
     i += len;
   }
   return diffFound;

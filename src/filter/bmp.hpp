@@ -18,6 +18,18 @@ private:
   bool isPossibleRgb565 = true;
   uint32_t rgb565Run = 0;
   static constexpr int rgb565MinRun = 63;
+
+  static void validateGeometry(int rowWidth, int pixelStride) {
+    if (rowWidth <= 0 || (pixelStride != 3 && pixelStride != 4))
+      quit("Corrupted RGB transform: invalid row geometry.");
+  }
+
+  static uint8_t readRequiredByte(File* input) {
+    const int value = input->getchar();
+    if (value == EOF)
+      quit("RGB transform input is truncated.");
+    return static_cast<uint8_t>(value);
+  }
 public:
 
   void setWidth(int w) {
@@ -32,14 +44,19 @@ public:
   }
 
   void encode(File *in, File *out, uint64_t size, int width, int & /*headerSize*/) override {
+    if (in == nullptr || out == nullptr)
+      quit("RGB transform input or output is unavailable.");
+    validateGeometry(width, stride);
     uint32_t r = 0;
     uint32_t g = 0; // green is always the middle channel in both RGB and BGR images, the transform is symmetric in r and b
     uint32_t b = 0;
-    for( int i = 0; i < static_cast<int>(size / width); i++ ) {
+    const uint64_t rowWidth = static_cast<uint64_t>(width);
+    const uint64_t rowCount = size / rowWidth;
+    for( uint64_t i = 0; i < rowCount; i++ ) {
       for( int j = 0; j < width / stride; j++ ) {
-        b = in->getchar();
-        g = in->getchar();
-        r = in->getchar();
+        b = readRequiredByte(in);
+        g = readRequiredByte(in);
+        r = readRequiredByte(in);
         if( isPossibleRgb565 ) {
           int rgb565RunPrevious = rgb565Run;
           rgb565Run = min(rgb565Run + 1, 0xFFFF) *
@@ -60,26 +77,31 @@ public:
         out->putChar(r);
         out->putChar(b);
         if (stride == 4) {
-          out->putChar(in->getchar());
+          out->putChar(readRequiredByte(in));
         }
       }
       for( int j = 0; j < width % stride; j++ ) {
-        out->putChar(in->getchar());
+        out->putChar(readRequiredByte(in));
       }
     }
-    for( int i = size % width; i > 0; i-- ) {
-      out->putChar(in->getchar());
+    for( uint64_t i = size % rowWidth; i > 0; i-- ) {
+      out->putChar(readRequiredByte(in));
     }
   }
 
   uint64_t decode(File * /*in*/, File *out, FMode fMode, uint64_t size, uint64_t &diffFound) override {
+    if (encoder == nullptr || out == nullptr)
+      quit("RGB decoder input or output is unavailable.");
+    validateGeometry(width, stride);
     uint32_t r = 0;
     uint32_t g = 0;
     uint32_t b = 0;
     uint32_t a = 0;
-    uint32_t p = 0;
-    for( int i = 0; i < static_cast<int>(size / width); i++ ) {
-      p = i * width;
+    uint64_t p = 0;
+    const uint64_t rowWidth = static_cast<uint64_t>(width);
+    const uint64_t rowCount = size / rowWidth;
+    for( uint64_t i = 0; i < rowCount; i++ ) {
+      p = i * rowWidth;
       for( int j = 0; j < width / stride; j++ ) {
         g = encoder->decompressByte(encoder->predictorMain);
         r = encoder->decompressByte(encoder->predictorMain);
@@ -140,13 +162,12 @@ public:
         }
       }
     }
-    for( int i = size % width; i > 0; i-- ) {
+    for( uint64_t i = size % rowWidth; i > 0; i-- ) {
       if( fMode == FMode::FDECOMPRESS ) {
         out->putChar(encoder->decompressByte(encoder->predictorMain));
       } else if( fMode == FMode::FCOMPARE ) {
         if( encoder->decompressByte(encoder->predictorMain) != out->getchar() && (diffFound == 0)) {
-          diffFound = size - i;
-          break;
+          diffFound = size - i + 1;
         }
       }
     }

@@ -14,12 +14,15 @@ private:
   FileName basePath;
   String listOfFiles; /**< path/file list in first column, columns separated by tabs, rows separated by newlines, with header in 1st row */
   Array<FileName *> names; /**< all file names parsed from listOfFiles */
+  Array<FileName *> relativeNames; /**< archive/list spellings before basePath is applied */
 public:
   ListOfFiles();
   ~ListOfFiles();
   void setBasePath(const char *s);
-  void addChar(char c);
+  void addChar(int c);
   int getCount();
   const char* getfilename(int i);
+  const char* getRelativeFilename(int i);
+  void setResolvedFilename(int i, const char* filename);
   String* getString();
 };

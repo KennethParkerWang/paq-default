@@ -1,5 +1,7 @@
 #include "FileTmp.hpp"
 
+#include <limits>
+
 void FileTmp::forgetContentInRam() {
   if( contentInRam != nullptr ) {
     delete contentInRam;
@@ -95,13 +97,17 @@ uint64_t FileTmp::blockRead(uint8_t *ptr, uint64_t count) {
 
 void FileTmp::blockWrite(uint8_t *ptr, uint64_t count) {
   if( contentInRam != nullptr ) {
-    if( filePos + count <= MAX_RAM_FOR_TMP_CONTENT ) {
-      contentInRam->resize((filePos + count));
+    if (count > std::numeric_limits<uint64_t>::max() - filePos)
+      quit("Temporary-file write range overflow.");
+    const uint64_t writeEnd = filePos + count;
+    if( writeEnd <= MAX_RAM_FOR_TMP_CONTENT ) {
+      const uint64_t newFileSize = writeEnd > fileSize ? writeEnd : fileSize;
+      contentInRam->resize(newFileSize);
       if( count > 0 ) {
         memcpy(&((*contentInRam)[filePos]), ptr, count);
       }
-      fileSize += count;
-      filePos += count;
+      fileSize = newFileSize;
+      filePos = writeEnd;
       return;
     }
     ramToDisk();
