@@ -25,7 +25,7 @@ enum class ExecutableIsa : uint8_t {
 };
 
 enum class ExecutableSpanKind : uint8_t {
-  OPAQUE = 0,
+  OPAQUE_DATA = 0,
   CODE = 1
 };
 
@@ -39,7 +39,7 @@ enum class ExecutableParseStatus : uint8_t {
 struct ExecutableSpan {
   uint64_t sourceOffset = 0;
   uint64_t sourceLength = 0;
-  ExecutableSpanKind kind = ExecutableSpanKind::OPAQUE;
+  ExecutableSpanKind kind = ExecutableSpanKind::OPAQUE_DATA;
   ExecutableIsa isa = ExecutableIsa::NONE;
   bool hasVirtualAddress = false;
   uint64_t virtualAddress = 0;
@@ -58,7 +58,7 @@ struct ExecutableCodeRegion {
 // inspected source interval occurs in exactly one output span.  Only regions
 // proven to be x86/x64 code by the native format metadata are marked CODE;
 // all headers, padding, data, overlays and unrecognized contents remain
-// OPAQUE and therefore stay on the ordinary PAQ path.
+// OPAQUE_DATA and therefore stay on the ordinary PAQ path.
 class ExecutableLayout {
 public:
   void clear() {
